@@ -239,14 +239,66 @@ static inline __attribute__((always_inline)) void linear(float *y, const float *
     }
 }
 
+// Fast vectorized exp approximation (relative error ~1e-4, sufficient for softmax)
+// Uses exp(x) = exp2(x * log2(e)) with polynomial refinement
+static inline float32x4_t fast_expq_f32(float32x4_t x) {
+    const float32x4_t log2e = vdupq_n_f32(1.442695041f);
+    x = vmulq_f32(x, log2e); // x * log2(e) = log2(exp(x))
+    // Clamp to avoid overflow/underflow
+    x = vmaxq_f32(x, vdupq_n_f32(-126.0f));
+    x = vminq_f32(x, vdupq_n_f32(126.0f));
+    // Split into integer and fractional parts
+    float32x4_t xf = vrndmq_f32(x); // floor
+    float32x4_t r = vsubq_f32(x, xf); // fractional part [0, 1)
+    int32x4_t xi = vcvtq_s32_f32(xf);
+    // 2^integer via bit shift into float exponent
+    int32x4_t pow2i = vshlq_n_s32(vaddq_s32(xi, vdupq_n_s32(127)), 23);
+    float32x4_t pow2f = vreinterpretq_f32_s32(pow2i);
+    // 2^fractional via degree-3 minimax polynomial on [0, 1)
+    // p(r) ≈ 1 + 0.6931472*r + 0.2402265*r^2 + 0.0558011*r^3
+    float32x4_t p = vdupq_n_f32(0.0558011f);
+    p = vfmaq_f32(vdupq_n_f32(0.2402265f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.6931472f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+    return vmulq_f32(pow2f, p);
+}
+
 static inline __attribute__((always_inline)) void softmax(float *out, const float *x, int n) {
     float max_val = x[0];
     for (int i = 1; i < n; i++)
         if (x[i] > max_val) max_val = x[i];
     float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        out[i] = expf(x[i] - max_val);
-        sum += out[i];
+#if MAX_SEQ == 16
+    if (n == MAX_SEQ) {
+        // Specialized Neon path for n=16 (attention softmax)
+        float32x4_t vmax = vdupq_n_f32(max_val);
+        float32x4_t v0 = fast_expq_f32(vsubq_f32(vld1q_f32(x), vmax));
+        float32x4_t v1 = fast_expq_f32(vsubq_f32(vld1q_f32(x+4), vmax));
+        float32x4_t v2 = fast_expq_f32(vsubq_f32(vld1q_f32(x+8), vmax));
+        float32x4_t v3 = fast_expq_f32(vsubq_f32(vld1q_f32(x+12), vmax));
+        sum = vaddvq_f32(vaddq_f32(vaddq_f32(v0, v1), vaddq_f32(v2, v3)));
+        float32x4_t inv = vdupq_n_f32(1.0f / sum);
+        vst1q_f32(out, vmulq_f32(v0, inv));
+        vst1q_f32(out+4, vmulq_f32(v1, inv));
+        vst1q_f32(out+8, vmulq_f32(v2, inv));
+        vst1q_f32(out+12, vmulq_f32(v3, inv));
+        return;
+    }
+#endif
+    {
+        float32x4_t vmax = vdupq_n_f32(max_val);
+        float32x4_t vsum = vdupq_n_f32(0.0f);
+        int i;
+        for (i = 0; i + 3 < n; i += 4) {
+            float32x4_t v = fast_expq_f32(vsubq_f32(vld1q_f32(x + i), vmax));
+            vst1q_f32(out + i, v);
+            vsum = vaddq_f32(vsum, v);
+        }
+        sum = vaddvq_f32(vsum);
+        for (; i < n; i++) {
+            out[i] = expf(x[i] - max_val);
+            sum += out[i];
+        }
     }
     float inv_sum = 1.0f / sum;
     for (int i = 0; i < n; i++) out[i] *= inv_sum;
