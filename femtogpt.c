@@ -10,6 +10,7 @@
 #include <string.h>
 #include <math.h>
 #include <mach/mach_time.h>
+#include <arm_neon.h>
 
 // ============================================================
 // Architecture constants (matching AttoGPT)
@@ -227,7 +228,7 @@ static inline __attribute__((always_inline)) void rms_norm(float *out, const flo
 
 // y[j] = sum_i W[j][i] * x[i] for j=0..out_dim-1
 // W is stored as W[out_dim][in_dim] (row-major), matching AttoGPT's li(x,w)
-static inline void linear(float *y, const float *W, const float *x, int out_dim, int in_dim) {
+static inline __attribute__((always_inline)) void linear(float *y, const float *W, const float *x, int out_dim, int in_dim) {
     for (int j = 0; j < out_dim; j++) {
         float sum = 0.0f;
         const float *row = W + j * in_dim;
@@ -516,21 +517,36 @@ static float forward(Model *m, Cache *c) {
         for (int h = 0; h < N_HEADS; h++) {
             int hoff = h * HEAD_DIM;
             for (int t = 0; t < MAX_SEQ; t++) {
+#if HEAD_DIM == 4
+                float32x4_t qt = vld1q_f32(&c->Q[b][t][hoff]);
+                for (int s = 0; s <= t; s++) {
+                    float32x4_t ks = vld1q_f32(&c->K[b][s][hoff]);
+                    c->attn_scores[b][h][t][s] = vaddvq_f32(vmulq_f32(qt, ks)) * INV_SQRT_HD;
+                }
+#else
                 for (int s = 0; s <= t; s++) {
                     float score = 0.0f;
                     for (int d = 0; d < HEAD_DIM; d++)
                         score += c->Q[b][t][hoff + d] * c->K[b][s][hoff + d];
                     c->attn_scores[b][h][t][s] = score * INV_SQRT_HD;
                 }
+#endif
                 for (int s = t + 1; s < MAX_SEQ; s++)
                     c->attn_scores[b][h][t][s] = -1e9f;
                 softmax(c->attn_scores[b][h][t], c->attn_scores[b][h][t], MAX_SEQ);
+#if HEAD_DIM == 4
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (int s = 0; s <= t; s++)
+                    acc = vfmaq_n_f32(acc, vld1q_f32(&c->V[b][s][hoff]), c->attn_scores[b][h][t][s]);
+                vst1q_f32(&c->attn_out[b][t][hoff], acc);
+#else
                 for (int d = 0; d < HEAD_DIM; d++) {
                     float sum = 0.0f;
                     for (int s = 0; s <= t; s++)
                         sum += c->attn_scores[b][h][t][s] * c->V[b][s][hoff + d];
                     c->attn_out[b][t][hoff + d] = sum;
                 }
+#endif
             }
         }
 
@@ -726,6 +742,18 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     int hoff = h * HEAD_DIM;
                     float dattn_scores_h[MAX_SEQ];
                     memset(dattn_scores_h, 0, sizeof(dattn_scores_h));
+#if HEAD_DIM == 4
+                    // Gather dattn_out from transposed layout
+                    float dao_tmp[4] = {dattn_out_T[hoff][t], dattn_out_T[hoff+1][t],
+                                        dattn_out_T[hoff+2][t], dattn_out_T[hoff+3][t]};
+                    float32x4_t dao = vld1q_f32(dao_tmp);
+                    for (int s = 0; s <= t; s++) {
+                        float32x4_t vs = vld1q_f32(&c->V[b][s][hoff]);
+                        dattn_scores_h[s] = vaddvq_f32(vmulq_f32(dao, vs));
+                        float32x4_t dv_old = vld1q_f32(&dV[s][hoff]);
+                        vst1q_f32(&dV[s][hoff], vfmaq_n_f32(dv_old, dao, c->attn_scores[b][h][t][s]));
+                    }
+#else
                     for (int s = 0; s <= t; s++) {
                         float ds = 0.0f;
                         for (int d = 0; d < HEAD_DIM; d++) {
@@ -734,12 +762,23 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         }
                         dattn_scores_h[s] = ds;
                     }
+#endif
                     float wsum = 0.0f;
                     for (int s = 0; s < MAX_SEQ; s++)
                         wsum += c->attn_scores[b][h][t][s] * dattn_scores_h[s];
                     float dscore_pre[MAX_SEQ];
                     for (int s = 0; s < MAX_SEQ; s++)
                         dscore_pre[s] = c->attn_scores[b][h][t][s] * (dattn_scores_h[s] - wsum);
+#if HEAD_DIM == 4
+                    float32x4_t qt_scaled = vmulq_n_f32(vld1q_f32(&c->Q[b][t][hoff]), INV_SQRT_HD);
+                    for (int s = 0; s <= t; s++) {
+                        float32x4_t ks = vld1q_f32(&c->K[b][s][hoff]);
+                        float32x4_t dq_old = vld1q_f32(&dQ[t][hoff]);
+                        vst1q_f32(&dQ[t][hoff], vfmaq_n_f32(dq_old, ks, dscore_pre[s] * INV_SQRT_HD));
+                        float32x4_t dk_old = vld1q_f32(&dK[s][hoff]);
+                        vst1q_f32(&dK[s][hoff], vfmaq_n_f32(dk_old, qt_scaled, dscore_pre[s]));
+                    }
+#else
                     float inv_sqrt_hd = INV_SQRT_HD;
                     for (int s = 0; s <= t; s++) {
                         for (int d = 0; d < HEAD_DIM; d++) {
@@ -747,6 +786,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
                             dK[s][hoff + d] += dscore_pre[s] * c->Q[b][t][hoff + d] * inv_sqrt_hd;
                         }
                     }
+#endif
                 }
             }
 
@@ -910,6 +950,15 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     int hoff = h * HEAD_DIM;
                     float dattn_scores_h[MAX_SEQ];
                     memset(dattn_scores_h, 0, sizeof(dattn_scores_h));
+#if HEAD_DIM == 4
+                    float32x4_t dao = vld1q_f32(&dattn_out[hoff]);
+                    for (int s = 0; s <= t; s++) {
+                        float32x4_t vs = vld1q_f32(&c->V[b][s][hoff]);
+                        dattn_scores_h[s] = vaddvq_f32(vmulq_f32(dao, vs));
+                        float32x4_t dv_old = vld1q_f32(&dV[s][hoff]);
+                        vst1q_f32(&dV[s][hoff], vfmaq_n_f32(dv_old, dao, c->attn_scores[b][h][t][s]));
+                    }
+#else
                     for (int s = 0; s <= t; s++) {
                         float ds = 0.0f;
                         for (int d = 0; d < HEAD_DIM; d++) {
@@ -918,12 +967,23 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         }
                         dattn_scores_h[s] = ds;
                     }
+#endif
                     float wsum = 0.0f;
                     for (int s = 0; s < MAX_SEQ; s++)
                         wsum += c->attn_scores[b][h][t][s] * dattn_scores_h[s];
                     float dscore_pre[MAX_SEQ];
                     for (int s = 0; s < MAX_SEQ; s++)
                         dscore_pre[s] = c->attn_scores[b][h][t][s] * (dattn_scores_h[s] - wsum);
+#if HEAD_DIM == 4
+                    float32x4_t qt_scaled = vmulq_n_f32(vld1q_f32(&c->Q[b][t][hoff]), INV_SQRT_HD);
+                    for (int s = 0; s <= t; s++) {
+                        float32x4_t ks = vld1q_f32(&c->K[b][s][hoff]);
+                        float32x4_t dq_old = vld1q_f32(&dQ[t][hoff]);
+                        vst1q_f32(&dQ[t][hoff], vfmaq_n_f32(dq_old, ks, dscore_pre[s] * INV_SQRT_HD));
+                        float32x4_t dk_old = vld1q_f32(&dK[s][hoff]);
+                        vst1q_f32(&dK[s][hoff], vfmaq_n_f32(dk_old, qt_scaled, dscore_pre[s]));
+                    }
+#else
                     float inv_sqrt_hd = INV_SQRT_HD;
                     for (int s = 0; s <= t; s++) {
                         for (int d = 0; d < HEAD_DIM; d++) {
@@ -931,6 +991,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
                             dK[s][hoff + d] += dscore_pre[s] * c->Q[b][t][hoff + d] * inv_sqrt_hd;
                         }
                     }
+#endif
                 }
             }
 
@@ -1071,22 +1132,37 @@ static void generate(Model *m, int n_names) {
             for (int h = 0; h < N_HEADS; h++) {
                 int hoff = h * HEAD_DIM;
                 float scores[MAX_SEQ];
+#if HEAD_DIM == 4
+                float32x4_t qt = vld1q_f32(&Q_t[hoff]);
+                for (int s = 0; s < t; s++) {
+                    float32x4_t ks = vld1q_f32(&K_all[s][hoff]);
+                    scores[s] = vaddvq_f32(vmulq_f32(qt, ks)) * INV_SQRT_HD;
+                }
+#else
                 for (int s = 0; s < t; s++) {
                     float sc = 0.0f;
                     for (int d = 0; d < HEAD_DIM; d++)
                         sc += Q_t[hoff + d] * K_all[s][hoff + d];
                     scores[s] = sc * INV_SQRT_HD;
                 }
+#endif
                 float max_s = scores[0];
                 for (int s = 1; s < t; s++) if (scores[s] > max_s) max_s = scores[s];
                 float sum_s = 0.0f;
                 for (int s = 0; s < t; s++) { scores[s] = expf(scores[s] - max_s); sum_s += scores[s]; }
                 for (int s = 0; s < t; s++) scores[s] /= sum_s;
+#if HEAD_DIM == 4
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (int s = 0; s < t; s++)
+                    acc = vfmaq_n_f32(acc, vld1q_f32(&V_all[s][hoff]), scores[s]);
+                vst1q_f32(&attn_out[hoff], acc);
+#else
                 for (int d = 0; d < HEAD_DIM; d++) {
                     float v = 0.0f;
                     for (int s = 0; s < t; s++) v += scores[s] * V_all[s][hoff + d];
                     attn_out[hoff + d] = v;
                 }
+#endif
             }
 
             // O projection + residual
