@@ -11,15 +11,6 @@
 #include <math.h>
 #include <mach/mach_time.h>
 
-#ifdef __ARM_FEATURE_SME2
-#include <arm_sme.h>
-#define USE_SME2 1
-#else
-#define USE_SME2 0
-#endif
-
-// Neon auto-vectorization: compiler handles it with -O3 -ffast-math
-
 // ============================================================
 // Architecture constants (matching AttoGPT)
 // ============================================================
@@ -46,6 +37,18 @@
 #define BETA1      0.85f
 #define BETA2      0.99f
 #define EPS        1e-8f
+#define INV_SQRT_HD (1.0f / sqrtf((float)HEAD_DIM))
+
+#ifdef __ARM_FEATURE_SME2
+#include <arm_sme.h>
+#if D_MODEL >= 32
+#define USE_SME2 1
+#else
+#define USE_SME2 0
+#endif
+#else
+#define USE_SME2 0
+#endif
 
 // ============================================================
 // RNG: xorshift64
@@ -213,7 +216,7 @@ static void init_model(Model *m) {
 // Forward pass primitives
 // ============================================================
 
-static void rms_norm(float *out, const float *x, int n, float *rms_out) {
+static inline __attribute__((always_inline)) void rms_norm(float *out, const float *x, int n, float *rms_out) {
     float sum_sq = 0.0f;
     for (int i = 0; i < n; i++) sum_sq += x[i] * x[i];
     float rms = sqrtf(sum_sq / (float)n + 1e-5f);
@@ -235,7 +238,7 @@ static inline void linear(float *y, const float *W, const float *x, int out_dim,
     }
 }
 
-static void softmax(float *out, const float *x, int n) {
+static inline __attribute__((always_inline)) void softmax(float *out, const float *x, int n) {
     float max_val = x[0];
     for (int i = 1; i < n; i++)
         if (x[i] > max_val) max_val = x[i];
@@ -409,6 +412,27 @@ static void sme2_outer_sum(float *dW, const float *left, const float *right, int
     }
 }
 
+// General batched matmul: C[M][MAX_SEQ] = W^T @ X[K][MAX_SEQ]
+// W_T_flat points to the "transposed weight" stored as [K][M] (row-major).
+// For forward: pass explicit transposed copy (Wq_T, etc.)
+// For backward input grads: pass ORIGINAL weight (Wf2, Wf1, Wo) directly.
+__arm_locally_streaming __arm_new("za")
+static void sme2_matmul(float *C, const float *W_T_flat, const float *X, int M, int K) {
+    svbool_t pred = svptrue_b32();
+    for (int bi = 0; bi < M; bi += 16) {
+        svzero_za();
+        for (int k = 0; k < K; k++) {
+            svfloat32_t w = svld1_f32(pred, W_T_flat + k * M + bi);
+            svfloat32_t x = svld1_f32(pred, X + k * MAX_SEQ);
+            svmopa_za32_f32_m(0, pred, pred, w, x);
+        }
+        for (int i = 0; i < 16; i++) {
+            svfloat32_t row = svread_hor_za32_f32_m(svdup_f32(0), pred, 0, i);
+            svst1_f32(pred, C + (bi + i) * MAX_SEQ, row);
+        }
+    }
+}
+
 // Batched QKV input gradient:
 // dnorm1[D_MODEL][MAX_SEQ] = Wq_T @ dQ_T + Wk_T @ dK_T + Wv_T @ dV_T
 // All inputs/outputs in [D_MODEL][MAX_SEQ] layout.
@@ -496,7 +520,7 @@ static float forward(Model *m, Cache *c) {
                     float score = 0.0f;
                     for (int d = 0; d < HEAD_DIM; d++)
                         score += c->Q[b][t][hoff + d] * c->K[b][s][hoff + d];
-                    c->attn_scores[b][h][t][s] = score / sqrtf((float)HEAD_DIM);
+                    c->attn_scores[b][h][t][s] = score * INV_SQRT_HD;
                 }
                 for (int s = t + 1; s < MAX_SEQ; s++)
                     c->attn_scores[b][h][t][s] = -1e9f;
@@ -628,137 +652,105 @@ static void backward(Model *m, Cache *c, Grads *g) {
         float dff_hidden_all[MAX_SEQ][D_FF];
         float dx_all[MAX_SEQ][D_MODEL]; // dx after FFN bwd (for residual in phase 3)
 
-        float dlogits[VOCAB];
-        float dx[D_MODEL];
-        float dattn_out[D_MODEL];
-
-        // ---- Phase 1: Per-position backward (reverse order) ----
-        // Compute input gradients for FFN/O-proj/attention.
-        // Defer weight gradient accumulation to phase 2 (FMOPA batched).
-        for (int t = MAX_SEQ - 1; t >= 0; t--) {
-            // 1. Cross-entropy gradient -> dlogits
-            memset(dlogits, 0, sizeof(dlogits));
-            if (t < slen - 1) {
-                int target = c->tokens[b][t + 1];
-                for (int v = 0; v < VOCAB; v++)
-                    dlogits[v] = c->probs[b][t][v] * inv_count;
-                dlogits[target] -= inv_count;
-            }
-
-            // 2. LM head backward (27x16, too small for FMOPA — inline)
-            memset(dx, 0, sizeof(dx));
-            for (int v = 0; v < VOCAB; v++) {
-                if (dlogits[v] == 0.0f) continue;
-                for (int d = 0; d < D_MODEL; d++) {
-                    g->Wlm[v][d] += dlogits[v] * c->res2[b][t][d];
-                    dx[d] += m->Wlm[v][d] * dlogits[v];
+#if USE_SME2
+        // ---- SME2 backward: batched FMOPA for input grads ----
+        {
+            // Stage A: LM head backward for all positions
+            float dx_T[D_MODEL][MAX_SEQ];
+            memset(dx_T, 0, sizeof(dx_T));
+            for (int t = 0; t < MAX_SEQ; t++) {
+                float dlogits[VOCAB];
+                memset(dlogits, 0, sizeof(dlogits));
+                if (t < slen - 1) {
+                    int target = c->tokens[b][t + 1];
+                    for (int v = 0; v < VOCAB; v++)
+                        dlogits[v] = c->probs[b][t][v] * inv_count;
+                    dlogits[target] -= inv_count;
+                }
+                for (int v = 0; v < VOCAB; v++) {
+                    if (dlogits[v] == 0.0f) continue;
+                    for (int d = 0; d < D_MODEL; d++) {
+                        g->Wlm[v][d] += dlogits[v] * c->res2[b][t][d];
+                        dx_T[d][t] += m->Wlm[v][d] * dlogits[v];
+                    }
                 }
             }
 
-            // 3. FFN backward — input grads only, store intermediates for weight grads
-            // res2 = res1 + ff_out => dff_out = dx (copy for weight grad)
-            memcpy(dff_out_all[t], dx, D_MODEL * sizeof(float));
-
-            // Wf2 input grad: dff_hidden[j] = sum_d Wf2[d][j] * dff_out[d]
-            float dff_hidden[D_FF];
-            memset(dff_hidden, 0, sizeof(dff_hidden));
-#if USE_SME2
-            // Batched per-position: dff_hidden = Wf2^T @ dff_out
-            // Wf2^T[j][d] = Wf2_T[j][d]. This is a matvec, use scalar.
-            for (int d = 0; d < D_MODEL; d++) {
-                if (dx[d] == 0.0f) continue;
-                for (int j = 0; j < D_FF; j++)
-                    dff_hidden[j] += m->Wf2[d][j] * dx[d];
-            }
-#else
-            for (int d = 0; d < D_MODEL; d++) {
-                if (dx[d] == 0.0f) continue;
-                for (int j = 0; j < D_FF; j++)
-                    dff_hidden[j] += m->Wf2[d][j] * dx[d];
-            }
-#endif
-
-            // ReLU backward
-            for (int j = 0; j < D_FF; j++) {
-                if (c->ff_pre_relu[b][t][j] <= 0.0f) dff_hidden[j] = 0.0f;
-            }
-            memcpy(dff_hidden_all[t], dff_hidden, D_FF * sizeof(float));
-
-            // Wf1 input grad: dnorm2[d] = sum_j Wf1[j][d] * dff_hidden[j]
-            float dnorm2[D_MODEL];
-            memset(dnorm2, 0, sizeof(dnorm2));
-            for (int j = 0; j < D_FF; j++) {
-                if (dff_hidden[j] == 0.0f) continue;
+            // dff_out = dx before norm2 update
+            for (int t = 0; t < MAX_SEQ; t++)
                 for (int d = 0; d < D_MODEL; d++)
-                    dnorm2[d] += m->Wf1[j][d] * dff_hidden[j];
-            }
+                    dff_out_all[t][d] = dx_T[d][t];
 
-            // RMS norm backward for norm2
-            {
+            // Stage B: dff_hidden = Wf2^T @ dx (batched FMOPA)
+            float dff_hidden_T[D_FF][MAX_SEQ];
+            sme2_matmul((float*)dff_hidden_T, (float*)m->Wf2, (float*)dx_T, D_FF, D_MODEL);
+
+            // Stage C: ReLU backward + store dff_hidden_all
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int j = 0; j < D_FF; j++) {
+                    if (c->ff_pre_relu[b][t][j] <= 0.0f)
+                        dff_hidden_T[j][t] = 0.0f;
+                    dff_hidden_all[t][j] = dff_hidden_T[j][t];
+                }
+
+            // Stage D: dnorm2 = Wf1^T @ dff_hidden (batched FMOPA)
+            float dnorm2_T[D_MODEL][MAX_SEQ];
+            sme2_matmul((float*)dnorm2_T, (float*)m->Wf1, (float*)dff_hidden_T, D_MODEL, D_FF);
+
+            // Stage E: RMS norm2 backward, update dx
+            for (int t = 0; t < MAX_SEQ; t++) {
                 float rms = c->norm2_rms[b][t];
                 float inv_rms = 1.0f / rms;
                 float dot = 0.0f;
                 for (int d = 0; d < D_MODEL; d++)
-                    dot += dnorm2[d] * c->res1[b][t][d];
+                    dot += dnorm2_T[d][t] * c->res1[b][t][d];
                 dot /= (rms * rms * D_MODEL);
                 for (int d = 0; d < D_MODEL; d++)
-                    dx[d] += dnorm2[d] * inv_rms - c->res1[b][t][d] * dot;
+                    dx_T[d][t] += dnorm2_T[d][t] * inv_rms - c->res1[b][t][d] * dot;
             }
 
-            // Save dx for phase 3 (residual connection: demb += dx)
-            memcpy(dx_all[t], dx, D_MODEL * sizeof(float));
-
-            // 4. O projection input grad
-            memcpy(do_proj_all[t], dx, D_MODEL * sizeof(float));
-            memset(dattn_out, 0, sizeof(dattn_out));
-#if USE_SME2
-            // matvec: dattn_out = Wo^T @ do_proj. Scalar is fine for single vector.
-            for (int d = 0; d < D_MODEL; d++) {
-                if (dx[d] == 0.0f) continue;
-                for (int i = 0; i < D_MODEL; i++)
-                    dattn_out[i] += m->Wo[d][i] * dx[d];
-            }
-#else
-            for (int d = 0; d < D_MODEL; d++) {
-                if (dx[d] == 0.0f) continue;
-                for (int i = 0; i < D_MODEL; i++)
-                    dattn_out[i] += m->Wo[d][i] * dx[d];
-            }
-#endif
-
-            // 5. Attention backward (value agg + softmax + scores)
-            for (int h = 0; h < N_HEADS; h++) {
-                int hoff = h * HEAD_DIM;
-                float dattn_scores_h[MAX_SEQ];
-                memset(dattn_scores_h, 0, sizeof(dattn_scores_h));
-                for (int s = 0; s <= t; s++) {
-                    float ds = 0.0f;
-                    for (int d = 0; d < HEAD_DIM; d++) {
-                        ds += dattn_out[hoff + d] * c->V[b][s][hoff + d];
-                        dV[s][hoff + d] += c->attn_scores[b][h][t][s] * dattn_out[hoff + d];
-                    }
-                    dattn_scores_h[s] = ds;
+            // dx_all and do_proj_all from updated dx
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++) {
+                    dx_all[t][d] = dx_T[d][t];
+                    do_proj_all[t][d] = dx_T[d][t];
                 }
-                float wsum = 0.0f;
-                for (int s = 0; s < MAX_SEQ; s++)
-                    wsum += c->attn_scores[b][h][t][s] * dattn_scores_h[s];
-                float dscore_pre[MAX_SEQ];
-                for (int s = 0; s < MAX_SEQ; s++)
-                    dscore_pre[s] = c->attn_scores[b][h][t][s] * (dattn_scores_h[s] - wsum);
-                float inv_sqrt_hd = 1.0f / sqrtf((float)HEAD_DIM);
-                for (int s = 0; s <= t; s++) {
-                    for (int d = 0; d < HEAD_DIM; d++) {
-                        dQ[t][hoff + d] += dscore_pre[s] * c->K[b][s][hoff + d] * inv_sqrt_hd;
-                        dK[s][hoff + d] += dscore_pre[s] * c->Q[b][t][hoff + d] * inv_sqrt_hd;
+
+            // Stage F: dattn_out = Wo^T @ dx (batched FMOPA, using updated dx)
+            float dattn_out_T[D_MODEL][MAX_SEQ];
+            sme2_matmul((float*)dattn_out_T, (float*)m->Wo, (float*)dx_T, D_MODEL, D_MODEL);
+
+            // Stage G: Attention backward
+            for (int t = MAX_SEQ - 1; t >= 0; t--) {
+                for (int h = 0; h < N_HEADS; h++) {
+                    int hoff = h * HEAD_DIM;
+                    float dattn_scores_h[MAX_SEQ];
+                    memset(dattn_scores_h, 0, sizeof(dattn_scores_h));
+                    for (int s = 0; s <= t; s++) {
+                        float ds = 0.0f;
+                        for (int d = 0; d < HEAD_DIM; d++) {
+                            ds += dattn_out_T[hoff + d][t] * c->V[b][s][hoff + d];
+                            dV[s][hoff + d] += c->attn_scores[b][h][t][s] * dattn_out_T[hoff + d][t];
+                        }
+                        dattn_scores_h[s] = ds;
+                    }
+                    float wsum = 0.0f;
+                    for (int s = 0; s < MAX_SEQ; s++)
+                        wsum += c->attn_scores[b][h][t][s] * dattn_scores_h[s];
+                    float dscore_pre[MAX_SEQ];
+                    for (int s = 0; s < MAX_SEQ; s++)
+                        dscore_pre[s] = c->attn_scores[b][h][t][s] * (dattn_scores_h[s] - wsum);
+                    float inv_sqrt_hd = INV_SQRT_HD;
+                    for (int s = 0; s <= t; s++) {
+                        for (int d = 0; d < HEAD_DIM; d++) {
+                            dQ[t][hoff + d] += dscore_pre[s] * c->K[b][s][hoff + d] * inv_sqrt_hd;
+                            dK[s][hoff + d] += dscore_pre[s] * c->Q[b][t][hoff + d] * inv_sqrt_hd;
+                        }
                     }
                 }
             }
-        }
 
-        // ---- Phase 2: Batched weight gradients + QKV input grads ----
-#if USE_SME2
-        {
-            // QKV weight grads: dWq += sum_t outer(dQ[t], norm1[t])
+            // ---- Batched weight gradients (FMOPA outer products) ----
             float dW_tmp[D_MODEL][D_MODEL];
             sme2_outer_sum((float*)dW_tmp, (float*)dQ, (float*)(c->norm1[b]), D_MODEL, D_MODEL);
             for (int d = 0; d < D_MODEL; d++)
@@ -775,13 +767,11 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 for (int i = 0; i < D_MODEL; i++)
                     g->Wv[d][i] += dW_tmp[d][i];
 
-            // O projection weight grad
             sme2_outer_sum((float*)dW_tmp, (float*)do_proj_all, (float*)(c->attn_out[b]), D_MODEL, D_MODEL);
             for (int d = 0; d < D_MODEL; d++)
                 for (int i = 0; i < D_MODEL; i++)
                     g->Wo[d][i] += dW_tmp[d][i];
 
-            // FFN weight grads
             float dWf2_tmp[D_MODEL][D_FF];
             sme2_outer_sum((float*)dWf2_tmp, (float*)dff_out_all, (float*)(c->ff_hidden[b]), D_MODEL, D_FF);
             for (int d = 0; d < D_MODEL; d++)
@@ -806,14 +796,12 @@ static void backward(Model *m, Cache *c, Grads *g) {
             float dnorm1_T[D_MODEL][MAX_SEQ];
             sme2_qkv_input_grad((float*)dnorm1_T, (float*)dQ_T, (float*)dK_T, (float*)dV_T);
 
-            // Phase 3: RMS norm backward + embedding backward (per-position)
+            // RMS norm backward + embedding backward
             for (int t = 0; t < MAX_SEQ; t++) {
-                // Transpose dnorm1_T[D][T] -> dnorm1[D] for position t
                 float dnorm1[D_MODEL];
                 for (int d = 0; d < D_MODEL; d++)
                     dnorm1[d] = dnorm1_T[d][t];
 
-                // RMS norm backward for norm1
                 float demb[D_MODEL];
                 {
                     float rms = c->norm1_rms[b][t];
@@ -826,11 +814,9 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         demb[d] = dnorm1[d] * inv_rms - c->emb[b][t][d] * dot;
                 }
 
-                // demb += dx (residual from res1 = emb + o_proj)
                 for (int d = 0; d < D_MODEL; d++)
                     demb[d] += dx_all[t][d];
 
-                // RMS norm backward for emb
                 float dtmp[D_MODEL];
                 {
                     float rms = c->emb_rms[b][t];
@@ -843,7 +829,6 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         dtmp[d] = demb[d] * inv_rms - c->raw_emb[b][t][d] * dot;
                 }
 
-                // Embedding backward
                 int tok = c->tokens[b][t];
                 for (int d = 0; d < D_MODEL; d++) {
                     g->tok_emb[tok][d] += dtmp[d];
@@ -852,79 +837,170 @@ static void backward(Model *m, Cache *c, Grads *g) {
             }
         }
 #else
-        // ---- Scalar path: per-position QKV backward + RMS norm + embedding ----
-        for (int t = MAX_SEQ - 1; t >= 0; t--) {
-            // QKV projection backward
-            float dnorm1[D_MODEL];
-            memset(dnorm1, 0, sizeof(dnorm1));
-            for (int d = 0; d < D_MODEL; d++) {
-                for (int i = 0; i < D_MODEL; i++) {
-                    g->Wq[d][i] += dQ[t][d] * c->norm1[b][t][i];
-                    g->Wk[d][i] += dK[t][d] * c->norm1[b][t][i];
-                    g->Wv[d][i] += dV[t][d] * c->norm1[b][t][i];
-                    dnorm1[i] += m->Wq[d][i] * dQ[t][d]
-                              +  m->Wk[d][i] * dK[t][d]
-                              +  m->Wv[d][i] * dV[t][d];
+        // ---- Scalar backward ----
+        {
+            float dlogits[VOCAB];
+            float dx[D_MODEL];
+            float dattn_out[D_MODEL];
+
+            // Phase 1: Per-position backward
+            for (int t = MAX_SEQ - 1; t >= 0; t--) {
+                memset(dlogits, 0, sizeof(dlogits));
+                if (t < slen - 1) {
+                    int target = c->tokens[b][t + 1];
+                    for (int v = 0; v < VOCAB; v++)
+                        dlogits[v] = c->probs[b][t][v] * inv_count;
+                    dlogits[target] -= inv_count;
+                }
+
+                memset(dx, 0, sizeof(dx));
+                for (int v = 0; v < VOCAB; v++) {
+                    if (dlogits[v] == 0.0f) continue;
+                    for (int d = 0; d < D_MODEL; d++) {
+                        g->Wlm[v][d] += dlogits[v] * c->res2[b][t][d];
+                        dx[d] += m->Wlm[v][d] * dlogits[v];
+                    }
+                }
+
+                memcpy(dff_out_all[t], dx, D_MODEL * sizeof(float));
+
+                float dff_hidden[D_FF];
+                memset(dff_hidden, 0, sizeof(dff_hidden));
+                for (int d = 0; d < D_MODEL; d++) {
+                    if (dx[d] == 0.0f) continue;
+                    for (int j = 0; j < D_FF; j++)
+                        dff_hidden[j] += m->Wf2[d][j] * dx[d];
+                }
+
+                for (int j = 0; j < D_FF; j++) {
+                    if (c->ff_pre_relu[b][t][j] <= 0.0f) dff_hidden[j] = 0.0f;
+                }
+                memcpy(dff_hidden_all[t], dff_hidden, D_FF * sizeof(float));
+
+                float dnorm2[D_MODEL];
+                memset(dnorm2, 0, sizeof(dnorm2));
+                for (int j = 0; j < D_FF; j++) {
+                    if (dff_hidden[j] == 0.0f) continue;
+                    for (int d = 0; d < D_MODEL; d++)
+                        dnorm2[d] += m->Wf1[j][d] * dff_hidden[j];
+                }
+
+                {
+                    float rms = c->norm2_rms[b][t];
+                    float inv_rms = 1.0f / rms;
+                    float dot = 0.0f;
+                    for (int d = 0; d < D_MODEL; d++)
+                        dot += dnorm2[d] * c->res1[b][t][d];
+                    dot /= (rms * rms * D_MODEL);
+                    for (int d = 0; d < D_MODEL; d++)
+                        dx[d] += dnorm2[d] * inv_rms - c->res1[b][t][d] * dot;
+                }
+
+                memcpy(dx_all[t], dx, D_MODEL * sizeof(float));
+
+                memcpy(do_proj_all[t], dx, D_MODEL * sizeof(float));
+                memset(dattn_out, 0, sizeof(dattn_out));
+                for (int d = 0; d < D_MODEL; d++) {
+                    if (dx[d] == 0.0f) continue;
+                    for (int i = 0; i < D_MODEL; i++)
+                        dattn_out[i] += m->Wo[d][i] * dx[d];
+                }
+
+                for (int h = 0; h < N_HEADS; h++) {
+                    int hoff = h * HEAD_DIM;
+                    float dattn_scores_h[MAX_SEQ];
+                    memset(dattn_scores_h, 0, sizeof(dattn_scores_h));
+                    for (int s = 0; s <= t; s++) {
+                        float ds = 0.0f;
+                        for (int d = 0; d < HEAD_DIM; d++) {
+                            ds += dattn_out[hoff + d] * c->V[b][s][hoff + d];
+                            dV[s][hoff + d] += c->attn_scores[b][h][t][s] * dattn_out[hoff + d];
+                        }
+                        dattn_scores_h[s] = ds;
+                    }
+                    float wsum = 0.0f;
+                    for (int s = 0; s < MAX_SEQ; s++)
+                        wsum += c->attn_scores[b][h][t][s] * dattn_scores_h[s];
+                    float dscore_pre[MAX_SEQ];
+                    for (int s = 0; s < MAX_SEQ; s++)
+                        dscore_pre[s] = c->attn_scores[b][h][t][s] * (dattn_scores_h[s] - wsum);
+                    float inv_sqrt_hd = INV_SQRT_HD;
+                    for (int s = 0; s <= t; s++) {
+                        for (int d = 0; d < HEAD_DIM; d++) {
+                            dQ[t][hoff + d] += dscore_pre[s] * c->K[b][s][hoff + d] * inv_sqrt_hd;
+                            dK[s][hoff + d] += dscore_pre[s] * c->Q[b][t][hoff + d] * inv_sqrt_hd;
+                        }
+                    }
                 }
             }
 
-            // O projection weight grad
-            for (int d = 0; d < D_MODEL; d++) {
-                for (int i = 0; i < D_MODEL; i++)
-                    g->Wo[d][i] += do_proj_all[t][d] * c->attn_out[b][t][i];
-            }
+            // Phase 2: Weight grads + QKV backward + norm/emb backward
+            for (int t = MAX_SEQ - 1; t >= 0; t--) {
+                float dnorm1[D_MODEL];
+                memset(dnorm1, 0, sizeof(dnorm1));
+                for (int d = 0; d < D_MODEL; d++) {
+                    for (int i = 0; i < D_MODEL; i++) {
+                        g->Wq[d][i] += dQ[t][d] * c->norm1[b][t][i];
+                        g->Wk[d][i] += dK[t][d] * c->norm1[b][t][i];
+                        g->Wv[d][i] += dV[t][d] * c->norm1[b][t][i];
+                        dnorm1[i] += m->Wq[d][i] * dQ[t][d]
+                                  +  m->Wk[d][i] * dK[t][d]
+                                  +  m->Wv[d][i] * dV[t][d];
+                    }
+                }
 
-            // FFN weight grads
-            for (int d = 0; d < D_MODEL; d++) {
-                if (dff_out_all[t][d] == 0.0f) continue;
-                for (int j = 0; j < D_FF; j++)
-                    g->Wf2[d][j] += dff_out_all[t][d] * c->ff_hidden[b][t][j];
-            }
-            for (int j = 0; j < D_FF; j++) {
-                if (dff_hidden_all[t][j] == 0.0f) continue;
+                for (int d = 0; d < D_MODEL; d++) {
+                    for (int i = 0; i < D_MODEL; i++)
+                        g->Wo[d][i] += do_proj_all[t][d] * c->attn_out[b][t][i];
+                }
+
+                for (int d = 0; d < D_MODEL; d++) {
+                    if (dff_out_all[t][d] == 0.0f) continue;
+                    for (int j = 0; j < D_FF; j++)
+                        g->Wf2[d][j] += dff_out_all[t][d] * c->ff_hidden[b][t][j];
+                }
+                for (int j = 0; j < D_FF; j++) {
+                    if (dff_hidden_all[t][j] == 0.0f) continue;
+                    for (int d = 0; d < D_MODEL; d++)
+                        g->Wf1[j][d] += dff_hidden_all[t][j] * c->norm2[b][t][d];
+                }
+
+                memset(dQ[t], 0, D_MODEL * sizeof(float));
+                memset(dK[t], 0, D_MODEL * sizeof(float));
+                memset(dV[t], 0, D_MODEL * sizeof(float));
+
+                float demb[D_MODEL];
+                {
+                    float rms = c->norm1_rms[b][t];
+                    float inv_rms = 1.0f / rms;
+                    float dot = 0.0f;
+                    for (int d = 0; d < D_MODEL; d++)
+                        dot += dnorm1[d] * c->emb[b][t][d];
+                    dot /= (rms * rms * D_MODEL);
+                    for (int d = 0; d < D_MODEL; d++)
+                        demb[d] = dnorm1[d] * inv_rms - c->emb[b][t][d] * dot;
+                }
+
                 for (int d = 0; d < D_MODEL; d++)
-                    g->Wf1[j][d] += dff_hidden_all[t][j] * c->norm2[b][t][d];
-            }
+                    demb[d] += dx_all[t][d];
 
-            memset(dQ[t], 0, D_MODEL * sizeof(float));
-            memset(dK[t], 0, D_MODEL * sizeof(float));
-            memset(dV[t], 0, D_MODEL * sizeof(float));
+                float dtmp[D_MODEL];
+                {
+                    float rms = c->emb_rms[b][t];
+                    float inv_rms = 1.0f / rms;
+                    float dot = 0.0f;
+                    for (int d = 0; d < D_MODEL; d++)
+                        dot += demb[d] * c->raw_emb[b][t][d];
+                    dot /= (rms * rms * D_MODEL);
+                    for (int d = 0; d < D_MODEL; d++)
+                        dtmp[d] = demb[d] * inv_rms - c->raw_emb[b][t][d] * dot;
+                }
 
-            // RMS norm backward for norm1
-            float demb[D_MODEL];
-            {
-                float rms = c->norm1_rms[b][t];
-                float inv_rms = 1.0f / rms;
-                float dot = 0.0f;
-                for (int d = 0; d < D_MODEL; d++)
-                    dot += dnorm1[d] * c->emb[b][t][d];
-                dot /= (rms * rms * D_MODEL);
-                for (int d = 0; d < D_MODEL; d++)
-                    demb[d] = dnorm1[d] * inv_rms - c->emb[b][t][d] * dot;
-            }
-
-            // demb += dx (residual)
-            for (int d = 0; d < D_MODEL; d++)
-                demb[d] += dx_all[t][d];
-
-            // RMS norm backward for emb
-            float dtmp[D_MODEL];
-            {
-                float rms = c->emb_rms[b][t];
-                float inv_rms = 1.0f / rms;
-                float dot = 0.0f;
-                for (int d = 0; d < D_MODEL; d++)
-                    dot += demb[d] * c->raw_emb[b][t][d];
-                dot /= (rms * rms * D_MODEL);
-                for (int d = 0; d < D_MODEL; d++)
-                    dtmp[d] = demb[d] * inv_rms - c->raw_emb[b][t][d] * dot;
-            }
-
-            // Embedding backward
-            int tok = c->tokens[b][t];
-            for (int d = 0; d < D_MODEL; d++) {
-                g->tok_emb[tok][d] += dtmp[d];
-                g->pos_emb[t][d] += dtmp[d];
+                int tok = c->tokens[b][t];
+                for (int d = 0; d < D_MODEL; d++) {
+                    g->tok_emb[tok][d] += dtmp[d];
+                    g->pos_emb[t][d] += dtmp[d];
+                }
             }
         }
 #endif
@@ -999,7 +1075,7 @@ static void generate(Model *m, int n_names) {
                     float sc = 0.0f;
                     for (int d = 0; d < HEAD_DIM; d++)
                         sc += Q_t[hoff + d] * K_all[s][hoff + d];
-                    scores[s] = sc / sqrtf((float)HEAD_DIM);
+                    scores[s] = sc * INV_SQRT_HD;
                 }
                 float max_s = scores[0];
                 for (int s = 1; s < t; s++) if (scores[s] > max_s) max_s = scores[s];
