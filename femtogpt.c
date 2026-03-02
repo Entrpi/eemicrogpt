@@ -522,6 +522,51 @@ static void sme2_qkv_input_grad(
 #endif // USE_SME2
 
 // ============================================================
+// Neon GEMM matmul functions (for non-SME2 batched path)
+// ============================================================
+#if !USE_SME2
+
+// C[M][N] = W[M][K] @ X[K][N]  (W in standard row-major)
+static inline __attribute__((always_inline)) void neon_matmul(
+    float *C, const float *W, const float *X, int M, int K, int N
+) {
+    memset(C, 0, M * N * sizeof(float));
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < K; k++) {
+            float32x4_t w = vdupq_n_f32(W[m * K + k]);
+            for (int n = 0; n < N; n += 4)
+                vst1q_f32(C + m*N + n, vfmaq_f32(vld1q_f32(C + m*N + n), w, vld1q_f32(X + k*N + n)));
+        }
+}
+
+// C[M][N] = W_orig^T @ X  where W_orig is stored [K][M]
+static inline __attribute__((always_inline)) void neon_matmul_t(
+    float *C, const float *W_orig, const float *X, int M, int K, int N
+) {
+    memset(C, 0, M * N * sizeof(float));
+    for (int k = 0; k < K; k++)
+        for (int m = 0; m < M; m++) {
+            float32x4_t w = vdupq_n_f32(W_orig[k * M + m]);
+            for (int n = 0; n < N; n += 4)
+                vst1q_f32(C + m*N + n, vfmaq_f32(vld1q_f32(C + m*N + n), w, vld1q_f32(X + k*N + n)));
+        }
+}
+
+// C[M][N] += W_orig^T @ X  (accumulating, does not zero C)
+static inline __attribute__((always_inline)) void neon_matmul_t_acc(
+    float *C, const float *W_orig, const float *X, int M, int K, int N
+) {
+    for (int k = 0; k < K; k++)
+        for (int m = 0; m < M; m++) {
+            float32x4_t w = vdupq_n_f32(W_orig[k * M + m]);
+            for (int n = 0; n < N; n += 4)
+                vst1q_f32(C + m*N + n, vfmaq_f32(vld1q_f32(C + m*N + n), w, vld1q_f32(X + k*N + n)));
+        }
+}
+
+#endif // !USE_SME2
+
+// ============================================================
 // Forward pass
 // Matches AttoGPT flow:
 //   x = rms(tok_emb[t] + pos_emb[p])
@@ -558,10 +603,21 @@ static float forward(Model *m, Cache *c) {
                 }
         }
 #else
-        for (int t = 0; t < MAX_SEQ; t++) {
-            linear(c->Q[b][t], (float*)m->Wq, c->norm1[b][t], D_MODEL, D_MODEL);
-            linear(c->K[b][t], (float*)m->Wk, c->norm1[b][t], D_MODEL, D_MODEL);
-            linear(c->V[b][t], (float*)m->Wv, c->norm1[b][t], D_MODEL, D_MODEL);
+        {
+            float X_T[D_MODEL][MAX_SEQ];
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++)
+                    X_T[d][t] = c->norm1[b][t][d];
+            float Q_T[D_MODEL][MAX_SEQ], K_T[D_MODEL][MAX_SEQ], V_T[D_MODEL][MAX_SEQ];
+            neon_matmul((float*)Q_T, (float*)m->Wq, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ);
+            neon_matmul((float*)K_T, (float*)m->Wk, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ);
+            neon_matmul((float*)V_T, (float*)m->Wv, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ);
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++) {
+                    c->Q[b][t][d] = Q_T[d][t];
+                    c->K[b][t][d] = K_T[d][t];
+                    c->V[b][t][d] = V_T[d][t];
+                }
         }
 #endif
 
@@ -617,10 +673,17 @@ static float forward(Model *m, Cache *c) {
                 }
         }
 #else
-        for (int t = 0; t < MAX_SEQ; t++) {
-            linear(c->o_proj[b][t], (float*)m->Wo, c->attn_out[b][t], D_MODEL, D_MODEL);
-            for (int d = 0; d < D_MODEL; d++)
-                c->res1[b][t][d] = c->emb[b][t][d] + c->o_proj[b][t][d];
+        {
+            float A_T[D_MODEL][MAX_SEQ], O_T[D_MODEL][MAX_SEQ];
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++)
+                    A_T[d][t] = c->attn_out[b][t][d];
+            neon_matmul((float*)O_T, (float*)m->Wo, (float*)A_T, D_MODEL, D_MODEL, MAX_SEQ);
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++) {
+                    c->o_proj[b][t][d] = O_T[d][t];
+                    c->res1[b][t][d] = c->emb[b][t][d] + O_T[d][t];
+                }
         }
 #endif
 
@@ -658,21 +721,55 @@ static float forward(Model *m, Cache *c) {
                 }
         }
 #else
-        for (int t = 0; t < MAX_SEQ; t++) {
-            linear(c->ff_pre_relu[b][t], (float*)m->Wf1, c->norm2[b][t], D_FF, D_MODEL);
-            for (int d = 0; d < D_FF; d++)
-                c->ff_hidden[b][t][d] = c->ff_pre_relu[b][t][d] > 0.0f ? c->ff_pre_relu[b][t][d] : 0.0f;
-            linear(c->ff_out[b][t], (float*)m->Wf2, c->ff_hidden[b][t], D_MODEL, D_FF);
-            for (int d = 0; d < D_MODEL; d++)
-                c->res2[b][t][d] = c->res1[b][t][d] + c->ff_out[b][t][d];
+        {
+            float N2_T[D_MODEL][MAX_SEQ];
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++)
+                    N2_T[d][t] = c->norm2[b][t][d];
+
+            float H[D_FF][MAX_SEQ];
+            neon_matmul((float*)H, (float*)m->Wf1, (float*)N2_T, D_FF, D_MODEL, MAX_SEQ);
+
+            for (int t = 0; t < MAX_SEQ; t++) {
+                for (int j = 0; j < D_FF; j++) {
+                    c->ff_pre_relu[b][t][j] = H[j][t];
+                    float v = H[j][t] > 0.0f ? H[j][t] : 0.0f;
+                    c->ff_hidden[b][t][j] = v;
+                    H[j][t] = v;
+                }
+            }
+
+            float Y[D_MODEL][MAX_SEQ];
+            neon_matmul((float*)Y, (float*)m->Wf2, (float*)H, D_MODEL, D_FF, MAX_SEQ);
+
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++) {
+                    c->ff_out[b][t][d] = Y[d][t];
+                    c->res2[b][t][d] = c->res1[b][t][d] + Y[d][t];
+                }
         }
 #endif
 
-        // 9. LM head + softmax (27x16 — too small for FMOPA)
+        // 9. LM head + softmax
+#if !USE_SME2
+        {
+            float R_T[D_MODEL][MAX_SEQ], L_T[VOCAB][MAX_SEQ];
+            for (int t = 0; t < MAX_SEQ; t++)
+                for (int d = 0; d < D_MODEL; d++)
+                    R_T[d][t] = c->res2[b][t][d];
+            neon_matmul((float*)L_T, (float*)m->Wlm, (float*)R_T, VOCAB, D_MODEL, MAX_SEQ);
+            for (int t = 0; t < MAX_SEQ; t++) {
+                for (int v = 0; v < VOCAB; v++)
+                    c->logits[b][t][v] = L_T[v][t];
+                softmax(c->probs[b][t], c->logits[b][t], VOCAB);
+            }
+        }
+#else
         for (int t = 0; t < MAX_SEQ; t++) {
             linear(c->logits[b][t], (float*)m->Wlm, c->res2[b][t], VOCAB, D_MODEL);
             softmax(c->probs[b][t], c->logits[b][t], VOCAB);
         }
+#endif
     }
 
     // Cross-entropy loss: predict next token for positions 0..slen-2
@@ -929,7 +1026,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
             }
         }
 #else
-        // ---- Scalar backward ----
+        // ---- Scalar backward: per-position with zero-check sparsity ----
         {
             float dlogits[VOCAB];
             float dx[D_MODEL];
