@@ -17,7 +17,7 @@ Optimized for Apple Silicon with SME2 (M4+), with scalar Neon fallback.
 #include <arm_neon.h>
 
 // ============================================================
-// Architecture constants (matching AttoGPT)
+// Architecture constants (matching microgpt)
 // ============================================================
 #ifndef D_MODEL
 #define D_MODEL    64
@@ -28,7 +28,7 @@ Optimized for Apple Silicon with SME2 (M4+), with scalar Neon fallback.
 #define HEAD_DIM   (D_MODEL / N_HEADS)
 #define D_FF       (4 * D_MODEL)
 #define VOCAB      27  // 26 letters (0..25) + boundary token (26)
-#define BOUNDARY   26  // boundary/null token index (B in AttoGPT)
+#define BOUNDARY   26  // boundary/null token index (B in microgpt)
 #define MAX_SEQ    16
 #ifndef BATCH
 #define BATCH      16
@@ -83,7 +83,7 @@ static float rand_normal(void) {
 
 // ============================================================
 // Model parameters
-// AttoGPT stores weights as W[out][in] (each row dotted with input).
+// microgpt stores weights as W[out][in] (each row dotted with input).
 // We store as W[out][in] to match, and our linear() handles this.
 // ============================================================
 typedef struct {
@@ -97,11 +97,11 @@ typedef struct {
     float Wo[D_MODEL][D_MODEL];          // output projection
 
     // FFN weights
-    // AttoGPT: S["01"] = M(E*4, E) = [64][16], S["02"] = M(E, E*4) = [16][64]
+    // microgpt: S["01"] = M(E*4, E) = [64][16], S["02"] = M(E, E*4) = [16][64]
     float Wf1[D_FF][D_MODEL];            // expand: [64][16], out=64, in=16
     float Wf2[D_MODEL][D_FF];            // contract: [16][64], out=16, in=64
 
-    // LM head: AttoGPT S["lm"] = M(V, E) = [27][16]
+    // LM head: microgpt S["lm"] = M(V, E) = [27][16]
     float Wlm[VOCAB][D_MODEL];           // lm head: [27][16]
 } Model;
 
@@ -168,7 +168,7 @@ static void load_names(const char *path) {
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) len--;
         if (len == 0) continue;
 
-        // AttoGPT encoding: t = [B] + [char indices] + [B]
+        // microgpt encoding: t = [B] + [char indices] + [B]
         // Where B = 26 (boundary token), chars = 0..25 (a=0, b=1, ..., z=25)
         // Sequence: [BOUNDARY, char0, char1, ..., charN-1, BOUNDARY, pad...]
         int *tok = all_tokens[num_names];
@@ -196,7 +196,7 @@ static void load_names(const char *path) {
 }
 
 // ============================================================
-// Initialization (AttoGPT uses gauss(0, 0.08))
+// Initialization (microgpt uses gauss(0, 0.08))
 // ============================================================
 static void gauss_init(float *w, int count, float std) {
     for (int i = 0; i < count; i++)
@@ -231,7 +231,7 @@ static inline __attribute__((always_inline)) void rms_norm(float *out, const flo
 }
 
 // y[j] = sum_i W[j][i] * x[i] for j=0..out_dim-1
-// W is stored as W[out_dim][in_dim] (row-major), matching AttoGPT's li(x,w)
+// W is stored as W[out_dim][in_dim] (row-major), matching microgpt's li(x,w)
 static inline __attribute__((always_inline)) void linear(
     float * __restrict__ y, const float * __restrict__ W,
     const float * __restrict__ x, int out_dim, int in_dim
@@ -642,7 +642,7 @@ static void sme2_qkv_input_grad(
 
 // ============================================================
 // Forward pass
-// Matches AttoGPT flow:
+// Matches microgpt flow:
 //   x = rms(tok_emb[t] + pos_emb[p])
 //   r = x; y = rms(x)
 //   QKV on y, attention, O proj
@@ -930,7 +930,7 @@ static float forward(Model *m, Cache *c) {
 #endif
 
     // Cross-entropy loss: predict next token for positions 0..slen-2
-    // AttoGPT: loss = sum(-log(softmax(logits)[target])) / n
+    // microgpt: loss = sum(-log(softmax(logits)[target])) / n
     float total_loss = 0.0f;
     int total_count = 0;
     for (int b = 0; b < BATCH; b++) {
@@ -1596,7 +1596,7 @@ static void generate(Model *m, int n_names) {
             // LM head
             linear(logits_t, (float*)m->Wlm, res2, VOCAB, D_MODEL);
 
-            // Temperature-scaled softmax (AttoGPT uses temp=0.5)
+            // Temperature-scaled softmax (microgpt uses temp=0.5)
             float temp = 0.5f;
             for (int v = 0; v < VOCAB; v++) logits_t[v] /= temp;
             softmax(probs_t, logits_t, VOCAB);
