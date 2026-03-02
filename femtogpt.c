@@ -42,7 +42,7 @@
 
 #ifdef __ARM_FEATURE_SME2
 #include <arm_sme.h>
-#if D_MODEL >= 32
+#if D_MODEL >= 64
 #define USE_SME2 1
 #else
 #define USE_SME2 0
@@ -266,6 +266,49 @@ static inline __attribute__((always_inline)) void linear_relu(
         float val = vaddvq_f32(acc);
         pre_relu[j] = val;
         hidden[j] = val > 0.0f ? val : 0.0f;
+    }
+}
+
+// 2-position batched linear + ReLU: shares weight loads across 2 input vectors
+static inline __attribute__((always_inline)) void linear_relu_2(
+    float * __restrict__ pr0, float * __restrict__ h0,
+    float * __restrict__ pr1, float * __restrict__ h1,
+    const float * __restrict__ W,
+    const float * __restrict__ x0, const float * __restrict__ x1,
+    int out_dim, int in_dim
+) {
+    for (int j = 0; j < out_dim; j++) {
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+        const float *row = W + j * in_dim;
+        for (int i = 0; i < in_dim; i += 4) {
+            float32x4_t w = vld1q_f32(row + i);
+            a0 = vfmaq_f32(a0, w, vld1q_f32(x0 + i));
+            a1 = vfmaq_f32(a1, w, vld1q_f32(x1 + i));
+        }
+        float v0 = vaddvq_f32(a0), v1 = vaddvq_f32(a1);
+        pr0[j] = v0; h0[j] = v0 > 0.0f ? v0 : 0.0f;
+        pr1[j] = v1; h1[j] = v1 > 0.0f ? v1 : 0.0f;
+    }
+}
+
+// 2-position batched linear + residual: shares weight loads across 2 input vectors
+static inline __attribute__((always_inline)) void linear_residual_2(
+    float * __restrict__ y0, const float * __restrict__ b0,
+    float * __restrict__ y1, const float * __restrict__ b1,
+    const float * __restrict__ W,
+    const float * __restrict__ x0, const float * __restrict__ x1,
+    int out_dim, int in_dim
+) {
+    for (int j = 0; j < out_dim; j++) {
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+        const float *row = W + j * in_dim;
+        for (int i = 0; i < in_dim; i += 4) {
+            float32x4_t w = vld1q_f32(row + i);
+            a0 = vfmaq_f32(a0, w, vld1q_f32(x0 + i));
+            a1 = vfmaq_f32(a1, w, vld1q_f32(x1 + i));
+        }
+        y0[j] = b0[j] + vaddvq_f32(a0);
+        y1[j] = b1[j] + vaddvq_f32(a1);
     }
 }
 
@@ -773,9 +816,20 @@ static float forward(Model *m, Cache *c) {
                     c->res2[b][t][d] = c->res1[b][t][d] + Y[d][t];
         }
 #else
-        for (int t = 0; t < slen; t++) {
-            linear_relu(c->ff_pre_relu[b][t], c->ff_hidden[b][t], (float*)m->Wf1, c->norm2[b][t], D_FF, D_MODEL);
-            linear_residual(c->res2[b][t], c->res1[b][t], (float*)m->Wf2, c->ff_hidden[b][t], D_MODEL, D_FF);
+        {
+            int t = 0;
+            for (; t + 1 < slen; t += 2) {
+                linear_relu_2(c->ff_pre_relu[b][t], c->ff_hidden[b][t],
+                              c->ff_pre_relu[b][t+1], c->ff_hidden[b][t+1],
+                              (float*)m->Wf1, c->norm2[b][t], c->norm2[b][t+1], D_FF, D_MODEL);
+                linear_residual_2(c->res2[b][t], c->res1[b][t],
+                                  c->res2[b][t+1], c->res1[b][t+1],
+                                  (float*)m->Wf2, c->ff_hidden[b][t], c->ff_hidden[b][t+1], D_MODEL, D_FF);
+            }
+            if (t < slen) {
+                linear_relu(c->ff_pre_relu[b][t], c->ff_hidden[b][t], (float*)m->Wf1, c->norm2[b][t], D_FF, D_MODEL);
+                linear_residual(c->res2[b][t], c->res1[b][t], (float*)m->Wf2, c->ff_hidden[b][t], D_MODEL, D_FF);
+            }
         }
 #endif
 
@@ -1073,15 +1127,14 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 float dff_out[D_MODEL];
                 memcpy(dff_out, dx, sizeof(dx));
 
-                // --- FFN backward: Wf2^T + ReLU (skip dead units) ---
+                // --- FFN backward: Wf2^T (branchless) + ReLU mask ---
                 float dff_hidden[D_FF];
-                for (int j = 0; j < D_FF; j++) {
-                    if (c->ff_pre_relu[b][t][j] <= 0.0f) { dff_hidden[j] = 0.0f; continue; }
-                    float32x4_t acc = vdupq_n_f32(0);
-                    const float *row = (float*)Wf2_T + j * D_MODEL;
-                    for (int i = 0; i < D_MODEL; i += 4)
-                        acc = vfmaq_f32(acc, vld1q_f32(row + i), vld1q_f32(dx + i));
-                    dff_hidden[j] = vaddvq_f32(acc);
+                linear(dff_hidden, (float*)Wf2_T, dx, D_FF, D_MODEL);
+                for (int j = 0; j < D_FF; j += 4) {
+                    float32x4_t pre = vld1q_f32(&c->ff_pre_relu[b][t][j]);
+                    uint32x4_t mask = vcgtq_f32(pre, vdupq_n_f32(0.0f));
+                    float32x4_t dh = vld1q_f32(&dff_hidden[j]);
+                    vst1q_f32(&dff_hidden[j], vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(dh), mask)));
                 }
 
                 // --- FFN backward: Wf1^T (dot-product via transposed weights) ---
