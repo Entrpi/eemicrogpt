@@ -42,10 +42,12 @@
 
 #ifdef __ARM_FEATURE_SME2
 #include <arm_sme.h>
+#ifndef USE_SME2
 #if D_MODEL >= 64
 #define USE_SME2 1
 #else
 #define USE_SME2 0
+#endif
 #endif
 #else
 #define USE_SME2 0
@@ -645,6 +647,157 @@ static void sme2_qkv_input_grad(
 //   logits = lm(x)
 // ============================================================
 static float forward(Model *m, Cache *c) {
+#if USE_SME2
+    // Operation-sequential: process all batch items per operation for L1 cache reuse
+    // Weights (~210 KB at d=64) exceed L1 (128 KB), so keeping one weight set hot helps
+
+    // 1-3. Embeddings + RMS norms for all batch items
+    for (int b = 0; b < BATCH; b++) {
+        int slen = c->seq_lens[b];
+        for (int t = 0; t < slen; t++) {
+            int tok = c->tokens[b][t];
+            for (int d = 0; d < D_MODEL; d++)
+                c->raw_emb[b][t][d] = m->tok_emb[tok][d] + m->pos_emb[t][d];
+            rms_norm(c->emb[b][t], c->raw_emb[b][t], D_MODEL, &c->emb_rms[b][t]);
+            rms_norm(c->norm1[b][t], c->emb[b][t], D_MODEL, &c->norm1_rms[b][t]);
+        }
+    }
+
+    // 4. QKV projections for all batch items (Wq_T, Wk_T, Wv_T stay hot in L1)
+    for (int b = 0; b < BATCH; b++) {
+        float X_T[D_MODEL][MAX_SEQ], Q_T[D_MODEL][MAX_SEQ], K_T[D_MODEL][MAX_SEQ], V_T[D_MODEL][MAX_SEQ];
+        for (int t = 0; t < MAX_SEQ; t++)
+            for (int d = 0; d < D_MODEL; d++)
+                X_T[d][t] = c->norm1[b][t][d];
+        sme2_qkv_project((float*)Q_T, (float*)K_T, (float*)V_T, (float*)X_T);
+        for (int t = 0; t < MAX_SEQ; t++)
+            for (int d = 0; d < D_MODEL; d++) {
+                c->Q[b][t][d] = Q_T[d][t];
+                c->K[b][t][d] = K_T[d][t];
+                c->V[b][t][d] = V_T[d][t];
+            }
+    }
+
+    // 5. Attention for all batch items (no weight matrices, just activations)
+    for (int b = 0; b < BATCH; b++) {
+        int slen = c->seq_lens[b];
+        for (int h = 0; h < N_HEADS; h++) {
+            int hoff = h * HEAD_DIM;
+            for (int t = 0; t < slen; t++) {
+                float max_score = -1e30f;
+#if HEAD_DIM == 4
+                float32x4_t qt = vld1q_f32(&c->Q[b][t][hoff]);
+                for (int s = 0; s <= t; s++) {
+                    float32x4_t ks = vld1q_f32(&c->K[b][s][hoff]);
+                    float score = vaddvq_f32(vmulq_f32(qt, ks)) * INV_SQRT_HD;
+                    c->attn_scores[b][h][t][s] = score;
+                    if (score > max_score) max_score = score;
+                }
+                float sum = 0.0f;
+                float32x4_t vacc = vdupq_n_f32(0.0f);
+                for (int s = 0; s <= t; s++) {
+                    float e = fast_expf_s(c->attn_scores[b][h][t][s] - max_score);
+                    c->attn_scores[b][h][t][s] = e;
+                    sum += e;
+                    vacc = vfmaq_n_f32(vacc, vld1q_f32(&c->V[b][s][hoff]), e);
+                }
+                float inv_sum = 1.0f / sum;
+                for (int s = 0; s <= t; s++)
+                    c->attn_scores[b][h][t][s] *= inv_sum;
+                vst1q_f32(&c->attn_out[b][t][hoff], vmulq_n_f32(vacc, inv_sum));
+#else
+                for (int s = 0; s <= t; s++) {
+                    float score = 0.0f;
+                    for (int d = 0; d < HEAD_DIM; d++)
+                        score += c->Q[b][t][hoff + d] * c->K[b][s][hoff + d];
+                    score *= INV_SQRT_HD;
+                    c->attn_scores[b][h][t][s] = score;
+                    if (score > max_score) max_score = score;
+                }
+                float sum = 0.0f;
+                for (int d = 0; d < HEAD_DIM; d++) c->attn_out[b][t][hoff + d] = 0.0f;
+                for (int s = 0; s <= t; s++) {
+                    float e = fast_expf_s(c->attn_scores[b][h][t][s] - max_score);
+                    c->attn_scores[b][h][t][s] = e;
+                    sum += e;
+                    for (int d = 0; d < HEAD_DIM; d++)
+                        c->attn_out[b][t][hoff + d] += e * c->V[b][s][hoff + d];
+                }
+                float inv_sum = 1.0f / sum;
+                for (int s = 0; s <= t; s++)
+                    c->attn_scores[b][h][t][s] *= inv_sum;
+                for (int d = 0; d < HEAD_DIM; d++)
+                    c->attn_out[b][t][hoff + d] *= inv_sum;
+#endif
+            }
+        }
+    }
+
+    // 6. O projection + residual for all batch items (Wo_T stays hot)
+    for (int b = 0; b < BATCH; b++) {
+        int slen = c->seq_lens[b];
+        float A_T[D_MODEL][MAX_SEQ], O_T[D_MODEL][MAX_SEQ];
+        for (int t = 0; t < MAX_SEQ; t++)
+            for (int d = 0; d < D_MODEL; d++)
+                A_T[d][t] = c->attn_out[b][t][d];
+        sme2_o_project((float*)O_T, (float*)A_T);
+        for (int t = 0; t < slen; t++)
+            for (int d = 0; d < D_MODEL; d++)
+                c->res1[b][t][d] = c->emb[b][t][d] + O_T[d][t];
+    }
+
+    // 7. RMS norm (pre-FFN) for all batch items
+    for (int b = 0; b < BATCH; b++) {
+        int slen = c->seq_lens[b];
+        for (int t = 0; t < slen; t++)
+            rms_norm(c->norm2[b][t], c->res1[b][t], D_MODEL, &c->norm2_rms[b][t]);
+    }
+
+    // 8. FFN for all batch items (Wf1_T, Wf2_T stay hot)
+    for (int b = 0; b < BATCH; b++) {
+        int slen = c->seq_lens[b];
+        float N2_T[D_MODEL][MAX_SEQ];
+        for (int t = 0; t < MAX_SEQ; t++)
+            for (int d = 0; d < D_MODEL; d++)
+                N2_T[d][t] = c->norm2[b][t][d];
+
+        float H[D_FF][MAX_SEQ];
+        sme2_ffn_expand((float*)H, (float*)N2_T);
+
+        for (int t = 0; t < slen; t++) {
+            for (int j = 0; j < D_FF; j++) {
+                c->ff_pre_relu[b][t][j] = H[j][t];
+                float v = H[j][t] > 0.0f ? H[j][t] : 0.0f;
+                c->ff_hidden[b][t][j] = v;
+                H[j][t] = v;
+            }
+        }
+
+        float Y[D_MODEL][MAX_SEQ];
+        sme2_ffn_contract((float*)Y, (float*)H);
+
+        for (int t = 0; t < slen; t++)
+            for (int d = 0; d < D_MODEL; d++)
+                c->res2[b][t][d] = c->res1[b][t][d] + Y[d][t];
+    }
+
+    // 9. LM head + softmax for all batch items (Wlm stays hot)
+    for (int b = 0; b < BATCH; b++) {
+        int slen = c->seq_lens[b];
+        int t = 0;
+        for (; t + 1 < slen; t += 2) {
+            linear_2(c->logits[b][t], c->logits[b][t+1], (float*)m->Wlm, c->res2[b][t], c->res2[b][t+1], VOCAB, D_MODEL);
+            softmax(c->probs[b][t], c->logits[b][t], VOCAB);
+            softmax(c->probs[b][t+1], c->logits[b][t+1], VOCAB);
+        }
+        if (t < slen) {
+            linear(c->logits[b][t], (float*)m->Wlm, c->res2[b][t], VOCAB, D_MODEL);
+            softmax(c->probs[b][t], c->logits[b][t], VOCAB);
+        }
+    }
+
+#else
+    // Batch-sequential for non-SME2 (data fits L1 at small D_MODEL)
     for (int b = 0; b < BATCH; b++) {
         int slen = c->seq_lens[b];
 
@@ -658,21 +811,6 @@ static float forward(Model *m, Cache *c) {
         }
 
         // 4. QKV projections
-#if USE_SME2
-        {
-            float X_T[D_MODEL][MAX_SEQ], Q_T[D_MODEL][MAX_SEQ], K_T[D_MODEL][MAX_SEQ], V_T[D_MODEL][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
-                for (int d = 0; d < D_MODEL; d++)
-                    X_T[d][t] = c->norm1[b][t][d];
-            sme2_qkv_project((float*)Q_T, (float*)K_T, (float*)V_T, (float*)X_T);
-            for (int t = 0; t < MAX_SEQ; t++)
-                for (int d = 0; d < D_MODEL; d++) {
-                    c->Q[b][t][d] = Q_T[d][t];
-                    c->K[b][t][d] = K_T[d][t];
-                    c->V[b][t][d] = V_T[d][t];
-                }
-        }
-#else
         {
             int t = 0;
             for (; t + 1 < slen; t += 2) {
@@ -686,13 +824,11 @@ static float forward(Model *m, Cache *c) {
                 linear(c->V[b][t], (float*)m->Wv, c->norm1[b][t], D_MODEL, D_MODEL);
             }
         }
-#endif
 
         // 5. Multi-head causal attention (fused: QK dots + softmax + V weighted sum)
         for (int h = 0; h < N_HEADS; h++) {
             int hoff = h * HEAD_DIM;
             for (int t = 0; t < slen; t++) {
-                // QK dot products + find max
                 float max_score = -1e30f;
 #if HEAD_DIM == 4
                 float32x4_t qt = vld1q_f32(&c->Q[b][t][hoff]);
@@ -702,7 +838,6 @@ static float forward(Model *m, Cache *c) {
                     c->attn_scores[b][h][t][s] = score;
                     if (score > max_score) max_score = score;
                 }
-                // Fused exp + V weighted sum
                 float sum = 0.0f;
                 float32x4_t vacc = vdupq_n_f32(0.0f);
                 for (int s = 0; s <= t; s++) {
@@ -711,7 +846,6 @@ static float forward(Model *m, Cache *c) {
                     sum += e;
                     vacc = vfmaq_n_f32(vacc, vld1q_f32(&c->V[b][s][hoff]), e);
                 }
-                // Normalize
                 float inv_sum = 1.0f / sum;
                 for (int s = 0; s <= t; s++)
                     c->attn_scores[b][h][t][s] *= inv_sum;
@@ -744,18 +878,6 @@ static float forward(Model *m, Cache *c) {
         }
 
         // 6. O projection + residual
-#if USE_SME2
-        {
-            float A_T[D_MODEL][MAX_SEQ], O_T[D_MODEL][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
-                for (int d = 0; d < D_MODEL; d++)
-                    A_T[d][t] = c->attn_out[b][t][d];
-            sme2_o_project((float*)O_T, (float*)A_T);
-            for (int t = 0; t < slen; t++)
-                for (int d = 0; d < D_MODEL; d++)
-                    c->res1[b][t][d] = c->emb[b][t][d] + O_T[d][t];
-        }
-#else
         {
             int t = 0;
             for (; t + 1 < slen; t += 2)
@@ -765,40 +887,12 @@ static float forward(Model *m, Cache *c) {
             if (t < slen)
                 linear_residual(c->res1[b][t], c->emb[b][t], (float*)m->Wo, c->attn_out[b][t], D_MODEL, D_MODEL);
         }
-#endif
 
         // 7. RMS norm (pre-FFN)
         for (int t = 0; t < slen; t++)
             rms_norm(c->norm2[b][t], c->res1[b][t], D_MODEL, &c->norm2_rms[b][t]);
 
         // 8. FFN: expand + ReLU + contract + residual
-#if USE_SME2
-        {
-            float N2_T[D_MODEL][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
-                for (int d = 0; d < D_MODEL; d++)
-                    N2_T[d][t] = c->norm2[b][t][d];
-
-            float H[D_FF][MAX_SEQ];
-            sme2_ffn_expand((float*)H, (float*)N2_T);
-
-            for (int t = 0; t < slen; t++) {
-                for (int j = 0; j < D_FF; j++) {
-                    c->ff_pre_relu[b][t][j] = H[j][t];
-                    float v = H[j][t] > 0.0f ? H[j][t] : 0.0f;
-                    c->ff_hidden[b][t][j] = v;
-                    H[j][t] = v;
-                }
-            }
-
-            float Y[D_MODEL][MAX_SEQ];
-            sme2_ffn_contract((float*)Y, (float*)H);
-
-            for (int t = 0; t < slen; t++)
-                for (int d = 0; d < D_MODEL; d++)
-                    c->res2[b][t][d] = c->res1[b][t][d] + Y[d][t];
-        }
-#else
         {
             int t = 0;
             for (; t + 1 < slen; t += 2) {
@@ -814,7 +908,6 @@ static float forward(Model *m, Cache *c) {
                 linear_residual(c->res2[b][t], c->res1[b][t], (float*)m->Wf2, c->ff_hidden[b][t], D_MODEL, D_FF);
             }
         }
-#endif
 
         // 9. LM head + softmax
         {
@@ -830,6 +923,7 @@ static float forward(Model *m, Cache *c) {
             }
         }
     }
+#endif
 
     // Cross-entropy loss: predict next token for positions 0..slen-2
     // AttoGPT: loss = sum(-log(softmax(logits)[target])) / n
