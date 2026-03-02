@@ -962,10 +962,10 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     }
 #endif
                     float wsum = 0.0f;
-                    for (int s = 0; s < MAX_SEQ; s++)
+                    for (int s = 0; s <= t; s++)
                         wsum += c->attn_scores[b][h][t][s] * dattn_scores_h[s];
                     float dscore_pre[MAX_SEQ];
-                    for (int s = 0; s < MAX_SEQ; s++)
+                    for (int s = 0; s <= t; s++)
                         dscore_pre[s] = c->attn_scores[b][h][t][s] * (dattn_scores_h[s] - wsum);
 #if HEAD_DIM == 4
                     float32x4_t qt_scaled = vmulq_n_f32(vld1q_f32(&c->Q[b][t][hoff]), INV_SQRT_HD);
@@ -1111,7 +1111,6 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 float dff_hidden[D_FF];
                 memset(dff_hidden, 0, sizeof(dff_hidden));
                 for (int d = 0; d < D_MODEL; d++) {
-                    if (dx[d] == 0.0f) continue;
                     float32x4_t dx_d = vdupq_n_f32(dx[d]);
                     for (int j = 0; j < D_FF; j += 4)
                         vst1q_f32(&dff_hidden[j], vfmaq_f32(vld1q_f32(&dff_hidden[j]), dx_d, vld1q_f32(&m->Wf2[d][j])));
@@ -1153,7 +1152,6 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 float dattn_out[D_MODEL];
                 memset(dattn_out, 0, sizeof(dattn_out));
                 for (int d = 0; d < D_MODEL; d++) {
-                    if (dx[d] == 0.0f) continue;
                     float32x4_t dx_d = vdupq_n_f32(dx[d]);
                     for (int i = 0; i < D_MODEL; i += 4)
                         vst1q_f32(&dattn_out[i], vfmaq_f32(vld1q_f32(&dattn_out[i]), dx_d, vld1q_f32(&m->Wo[d][i])));
@@ -1183,10 +1181,10 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     }
 #endif
                     float wsum = 0.0f;
-                    for (int s = 0; s < MAX_SEQ; s++)
+                    for (int s = 0; s <= t; s++)
                         wsum += c->attn_scores[b][h][t][s] * dattn_scores_h[s];
                     float dscore_pre[MAX_SEQ];
-                    for (int s = 0; s < MAX_SEQ; s++)
+                    for (int s = 0; s <= t; s++)
                         dscore_pre[s] = c->attn_scores[b][h][t][s] * (dattn_scores_h[s] - wsum);
 #if HEAD_DIM == 4
                     float32x4_t qt_scaled = vmulq_n_f32(vld1q_f32(&c->Q[b][t][hoff]), INV_SQRT_HD);
@@ -1252,7 +1250,6 @@ static void backward(Model *m, Cache *c, Grads *g) {
 
                 // Wf2 weight grads (using dff_out = dx before FFN backward)
                 for (int d = 0; d < D_MODEL; d++) {
-                    if (dff_out[d] == 0.0f) continue;
                     float32x4_t dfo_d = vdupq_n_f32(dff_out[d]);
                     for (int j = 0; j < D_FF; j += 4)
                         vst1q_f32(&g->Wf2[d][j], vfmaq_f32(vld1q_f32(&g->Wf2[d][j]), dfo_d, vld1q_f32(&c->ff_hidden[b][t][j])));
