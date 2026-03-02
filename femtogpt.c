@@ -811,11 +811,13 @@ static void backward(Model *m, Cache *c, Grads *g) {
         memset(dK, 0, sizeof(dK));
         memset(dV, 0, sizeof(dV));
 
-        // Per-position intermediates for batched weight grads
+        // Per-position intermediates for batched weight grads (SME2 only)
+#if USE_SME2
         float do_proj_all[MAX_SEQ][D_MODEL];
         float dff_out_all[MAX_SEQ][D_MODEL];
         float dff_hidden_all[MAX_SEQ][D_FF];
-        float dx_all[MAX_SEQ][D_MODEL]; // dx after FFN bwd (for residual in phase 3)
+        float dx_all[MAX_SEQ][D_MODEL];
+#endif
 
 #if USE_SME2
         // ---- SME2 backward: batched FMOPA for input grads ----
@@ -1026,14 +1028,14 @@ static void backward(Model *m, Cache *c, Grads *g) {
             }
         }
 #else
-        // ---- Scalar backward: per-position with zero-check sparsity ----
+        // ---- Scalar backward: fused per-position (Phase 1+2 merged) ----
+        // After attention backward at position t, dQ[t]/dK[t]/dV[t] are finalized.
+        // We immediately compute weight grads and norm backward, eliminating
+        // intermediate arrays and improving cache locality.
         {
-            float dlogits[VOCAB];
-            float dx[D_MODEL];
-            float dattn_out[D_MODEL];
-
-            // Phase 1: Per-position backward
             for (int t = MAX_SEQ - 1; t >= 0; t--) {
+                // --- LM head backward ---
+                float dlogits[VOCAB];
                 memset(dlogits, 0, sizeof(dlogits));
                 if (t < slen - 1) {
                     int target = c->tokens[b][t + 1];
@@ -1042,6 +1044,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     dlogits[target] -= inv_count;
                 }
 
+                float dx[D_MODEL];
                 memset(dx, 0, sizeof(dx));
                 for (int v = 0; v < VOCAB; v++) {
                     if (dlogits[v] == 0.0f) continue;
@@ -1051,8 +1054,11 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     }
                 }
 
-                memcpy(dff_out_all[t], dx, D_MODEL * sizeof(float));
+                // Save dx before FFN backward for Wf2 weight grads
+                float dff_out[D_MODEL];
+                memcpy(dff_out, dx, sizeof(dx));
 
+                // --- FFN backward: Wf2^T ---
                 float dff_hidden[D_FF];
                 memset(dff_hidden, 0, sizeof(dff_hidden));
                 for (int d = 0; d < D_MODEL; d++) {
@@ -1061,11 +1067,11 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         dff_hidden[j] += m->Wf2[d][j] * dx[d];
                 }
 
-                for (int j = 0; j < D_FF; j++) {
+                // ReLU backward
+                for (int j = 0; j < D_FF; j++)
                     if (c->ff_pre_relu[b][t][j] <= 0.0f) dff_hidden[j] = 0.0f;
-                }
-                memcpy(dff_hidden_all[t], dff_hidden, D_FF * sizeof(float));
 
+                // --- FFN backward: Wf1^T ---
                 float dnorm2[D_MODEL];
                 memset(dnorm2, 0, sizeof(dnorm2));
                 for (int j = 0; j < D_FF; j++) {
@@ -1074,6 +1080,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         dnorm2[d] += m->Wf1[j][d] * dff_hidden[j];
                 }
 
+                // Norm2 backward → update dx
                 {
                     float rms = c->norm2_rms[b][t];
                     float inv_rms = 1.0f / rms;
@@ -1085,9 +1092,8 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         dx[d] += dnorm2[d] * inv_rms - c->res1[b][t][d] * dot;
                 }
 
-                memcpy(dx_all[t], dx, D_MODEL * sizeof(float));
-
-                memcpy(do_proj_all[t], dx, D_MODEL * sizeof(float));
+                // --- O projection backward: Wo^T ---
+                float dattn_out[D_MODEL];
                 memset(dattn_out, 0, sizeof(dattn_out));
                 for (int d = 0; d < D_MODEL; d++) {
                     if (dx[d] == 0.0f) continue;
@@ -1095,6 +1101,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         dattn_out[i] += m->Wo[d][i] * dx[d];
                 }
 
+                // --- Attention backward ---
                 for (int h = 0; h < N_HEADS; h++) {
                     int hoff = h * HEAD_DIM;
                     float dattn_scores_h[MAX_SEQ];
@@ -1142,12 +1149,30 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     }
 #endif
                 }
-            }
 
-            // Phase 2: Weight grads + QKV backward + norm/emb backward
-            for (int t = MAX_SEQ - 1; t >= 0; t--) {
+                // === Weight grads + input grads (fused, dQ[t]/dK[t]/dV[t] finalized) ===
+
+                // QKV weight grads + input grads
                 float dnorm1[D_MODEL];
                 memset(dnorm1, 0, sizeof(dnorm1));
+#if HEAD_DIM == 4
+                for (int d = 0; d < D_MODEL; d++) {
+                    float32x4_t dq_d = vdupq_n_f32(dQ[t][d]);
+                    float32x4_t dk_d = vdupq_n_f32(dK[t][d]);
+                    float32x4_t dv_d = vdupq_n_f32(dV[t][d]);
+                    for (int i = 0; i < D_MODEL; i += 4) {
+                        float32x4_t n1 = vld1q_f32(&c->norm1[b][t][i]);
+                        vst1q_f32(&g->Wq[d][i], vfmaq_f32(vld1q_f32(&g->Wq[d][i]), dq_d, n1));
+                        vst1q_f32(&g->Wk[d][i], vfmaq_f32(vld1q_f32(&g->Wk[d][i]), dk_d, n1));
+                        vst1q_f32(&g->Wv[d][i], vfmaq_f32(vld1q_f32(&g->Wv[d][i]), dv_d, n1));
+                        float32x4_t dn = vld1q_f32(&dnorm1[i]);
+                        dn = vfmaq_f32(dn, vld1q_f32(&m->Wq[d][i]), dq_d);
+                        dn = vfmaq_f32(dn, vld1q_f32(&m->Wk[d][i]), dk_d);
+                        dn = vfmaq_f32(dn, vld1q_f32(&m->Wv[d][i]), dv_d);
+                        vst1q_f32(&dnorm1[i], dn);
+                    }
+                }
+#else
                 for (int d = 0; d < D_MODEL; d++) {
                     for (int i = 0; i < D_MODEL; i++) {
                         g->Wq[d][i] += dQ[t][d] * c->norm1[b][t][i];
@@ -1158,27 +1183,34 @@ static void backward(Model *m, Cache *c, Grads *g) {
                                   +  m->Wv[d][i] * dV[t][d];
                     }
                 }
+#endif
 
+                // Wo weight grads (using dx which = do_proj)
                 for (int d = 0; d < D_MODEL; d++) {
                     for (int i = 0; i < D_MODEL; i++)
-                        g->Wo[d][i] += do_proj_all[t][d] * c->attn_out[b][t][i];
+                        g->Wo[d][i] += dx[d] * c->attn_out[b][t][i];
                 }
 
+                // Wf2 weight grads (using dff_out = dx before FFN backward)
                 for (int d = 0; d < D_MODEL; d++) {
-                    if (dff_out_all[t][d] == 0.0f) continue;
+                    if (dff_out[d] == 0.0f) continue;
                     for (int j = 0; j < D_FF; j++)
-                        g->Wf2[d][j] += dff_out_all[t][d] * c->ff_hidden[b][t][j];
-                }
-                for (int j = 0; j < D_FF; j++) {
-                    if (dff_hidden_all[t][j] == 0.0f) continue;
-                    for (int d = 0; d < D_MODEL; d++)
-                        g->Wf1[j][d] += dff_hidden_all[t][j] * c->norm2[b][t][d];
+                        g->Wf2[d][j] += dff_out[d] * c->ff_hidden[b][t][j];
                 }
 
+                // Wf1 weight grads
+                for (int j = 0; j < D_FF; j++) {
+                    if (dff_hidden[j] == 0.0f) continue;
+                    for (int d = 0; d < D_MODEL; d++)
+                        g->Wf1[j][d] += dff_hidden[j] * c->norm2[b][t][d];
+                }
+
+                // Clear dQ/dK/dV for next batch item
                 memset(dQ[t], 0, D_MODEL * sizeof(float));
                 memset(dK[t], 0, D_MODEL * sizeof(float));
                 memset(dV[t], 0, D_MODEL * sizeof(float));
 
+                // Norm1 backward
                 float demb[D_MODEL];
                 {
                     float rms = c->norm1_rms[b][t];
@@ -1191,9 +1223,11 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         demb[d] = dnorm1[d] * inv_rms - c->emb[b][t][d] * dot;
                 }
 
+                // Residual connection
                 for (int d = 0; d < D_MODEL; d++)
-                    demb[d] += dx_all[t][d];
+                    demb[d] += dx[d];
 
+                // Emb RMS norm backward
                 float dtmp[D_MODEL];
                 {
                     float rms = c->emb_rms[b][t];
