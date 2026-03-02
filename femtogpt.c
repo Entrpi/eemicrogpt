@@ -226,7 +226,10 @@ static inline __attribute__((always_inline)) void rms_norm(float *out, const flo
 
 // y[j] = sum_i W[j][i] * x[i] for j=0..out_dim-1
 // W is stored as W[out_dim][in_dim] (row-major), matching AttoGPT's li(x,w)
-static inline __attribute__((always_inline)) void linear(float *y, const float *W, const float *x, int out_dim, int in_dim) {
+static inline __attribute__((always_inline)) void linear(
+    float * __restrict__ y, const float * __restrict__ W,
+    const float * __restrict__ x, int out_dim, int in_dim
+) {
     for (int j = 0; j < out_dim; j++) {
         float32x4_t acc = vdupq_n_f32(0);
         const float *row = W + j * in_dim;
@@ -238,7 +241,8 @@ static inline __attribute__((always_inline)) void linear(float *y, const float *
 
 // y[j] = base[j] + sum_i W[j][i] * x[i] — fused matvec + residual
 static inline __attribute__((always_inline)) void linear_residual(
-    float *y, const float *base, const float *W, const float *x, int out_dim, int in_dim
+    float * __restrict__ y, const float * __restrict__ base,
+    const float * __restrict__ W, const float * __restrict__ x, int out_dim, int in_dim
 ) {
     for (int j = 0; j < out_dim; j++) {
         float32x4_t acc = vdupq_n_f32(0);
@@ -251,7 +255,8 @@ static inline __attribute__((always_inline)) void linear_residual(
 
 // Fused linear + ReLU: pre_relu[j] = W@x, hidden[j] = max(0, pre_relu[j])
 static inline __attribute__((always_inline)) void linear_relu(
-    float *pre_relu, float *hidden, const float *W, const float *x, int out_dim, int in_dim
+    float * __restrict__ pre_relu, float * __restrict__ hidden,
+    const float * __restrict__ W, const float * __restrict__ x, int out_dim, int in_dim
 ) {
     for (int j = 0; j < out_dim; j++) {
         float32x4_t acc = vdupq_n_f32(0);
