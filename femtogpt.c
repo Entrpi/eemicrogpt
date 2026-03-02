@@ -269,6 +269,26 @@ static inline __attribute__((always_inline)) void linear_relu(
     }
 }
 
+// 2-position batched linear: shares weight loads across 2 input vectors
+static inline __attribute__((always_inline)) void linear_2(
+    float * __restrict__ y0, float * __restrict__ y1,
+    const float * __restrict__ W,
+    const float * __restrict__ x0, const float * __restrict__ x1,
+    int out_dim, int in_dim
+) {
+    for (int j = 0; j < out_dim; j++) {
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+        const float *row = W + j * in_dim;
+        for (int i = 0; i < in_dim; i += 4) {
+            float32x4_t w = vld1q_f32(row + i);
+            a0 = vfmaq_f32(a0, w, vld1q_f32(x0 + i));
+            a1 = vfmaq_f32(a1, w, vld1q_f32(x1 + i));
+        }
+        y0[j] = vaddvq_f32(a0);
+        y1[j] = vaddvq_f32(a1);
+    }
+}
+
 // 2-position batched linear + ReLU: shares weight loads across 2 input vectors
 static inline __attribute__((always_inline)) void linear_relu_2(
     float * __restrict__ pr0, float * __restrict__ h0,
@@ -310,6 +330,23 @@ static inline __attribute__((always_inline)) void linear_residual_2(
         y0[j] = b0[j] + vaddvq_f32(a0);
         y1[j] = b1[j] + vaddvq_f32(a1);
     }
+}
+
+// Fast scalar exp approximation (relative error ~1e-4, matching the vector version)
+static inline float fast_expf_s(float x) {
+    x *= 1.442695041f; // log2(e)
+    if (x < -126.0f) x = -126.0f;
+    if (x > 126.0f) x = 126.0f;
+    float xf = __builtin_floorf(x);
+    float r = x - xf;
+    int xi = (int)xf;
+    union { float f; int32_t i; } u;
+    u.i = (xi + 127) << 23;
+    float p = 0.0558011f;
+    p = 0.2402265f + p * r;
+    p = 0.6931472f + p * r;
+    p = 1.0f + p * r;
+    return u.f * p;
 }
 
 // Fast vectorized exp approximation (relative error ~1e-4, sufficient for softmax)
@@ -594,94 +631,7 @@ static void sme2_qkv_input_grad(
 
 #endif // USE_SME2
 
-// ============================================================
-// Neon GEMM matmul functions (for non-SME2 batched path)
-// ============================================================
 #if !USE_SME2
-
-// C[M][stride] = W[M][K] @ X[K][stride], processing only ncols columns
-// Uses register accumulators: 1-4 float32x4_t based on ncols (rounded up to multiple of 4)
-// stride = array row width (MAX_SEQ), ncols = actual columns to compute
-static inline __attribute__((always_inline)) void neon_matmul(
-    float *C, const float *W, const float *X, int M, int K, int stride, int ncols
-) {
-    int n4 = (ncols + 3) >> 2;
-    switch (n4) {
-    case 1:
-        for (int m = 0; m < M; m++) {
-            float32x4_t a0 = vdupq_n_f32(0);
-            for (int k = 0; k < K; k++)
-                a0 = vfmaq_f32(a0, vdupq_n_f32(W[m*K+k]), vld1q_f32(X + k*stride));
-            vst1q_f32(C + m*stride, a0);
-        }
-        break;
-    case 2:
-        for (int m = 0; m < M; m++) {
-            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
-            for (int k = 0; k < K; k++) {
-                float32x4_t w = vdupq_n_f32(W[m*K+k]);
-                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*stride));
-                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*stride + 4));
-            }
-            vst1q_f32(C + m*stride, a0); vst1q_f32(C + m*stride + 4, a1);
-        }
-        break;
-    case 3:
-        for (int m = 0; m < M; m++) {
-            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0), a2 = vdupq_n_f32(0);
-            for (int k = 0; k < K; k++) {
-                float32x4_t w = vdupq_n_f32(W[m*K+k]);
-                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*stride));
-                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*stride + 4));
-                a2 = vfmaq_f32(a2, w, vld1q_f32(X + k*stride + 8));
-            }
-            vst1q_f32(C + m*stride, a0); vst1q_f32(C + m*stride + 4, a1);
-            vst1q_f32(C + m*stride + 8, a2);
-        }
-        break;
-    default: // 4 (N=13..16)
-        for (int m = 0; m < M; m++) {
-            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
-            float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
-            for (int k = 0; k < K; k++) {
-                float32x4_t w = vdupq_n_f32(W[m*K+k]);
-                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*stride));
-                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*stride + 4));
-                a2 = vfmaq_f32(a2, w, vld1q_f32(X + k*stride + 8));
-                a3 = vfmaq_f32(a3, w, vld1q_f32(X + k*stride + 12));
-            }
-            vst1q_f32(C + m*stride, a0); vst1q_f32(C + m*stride + 4, a1);
-            vst1q_f32(C + m*stride + 8, a2); vst1q_f32(C + m*stride + 12, a3);
-        }
-        break;
-    }
-}
-
-// C[M][N] = W_orig^T @ X  where W_orig is stored [K][M]
-static inline __attribute__((always_inline)) void neon_matmul_t(
-    float *C, const float *W_orig, const float *X, int M, int K, int N
-) {
-    memset(C, 0, M * N * sizeof(float));
-    for (int k = 0; k < K; k++)
-        for (int m = 0; m < M; m++) {
-            float32x4_t w = vdupq_n_f32(W_orig[k * M + m]);
-            for (int n = 0; n < N; n += 4)
-                vst1q_f32(C + m*N + n, vfmaq_f32(vld1q_f32(C + m*N + n), w, vld1q_f32(X + k*N + n)));
-        }
-}
-
-// C[M][N] += W_orig^T @ X  (accumulating, does not zero C)
-static inline __attribute__((always_inline)) void neon_matmul_t_acc(
-    float *C, const float *W_orig, const float *X, int M, int K, int N
-) {
-    for (int k = 0; k < K; k++)
-        for (int m = 0; m < M; m++) {
-            float32x4_t w = vdupq_n_f32(W_orig[k * M + m]);
-            for (int n = 0; n < N; n += 4)
-                vst1q_f32(C + m*N + n, vfmaq_f32(vld1q_f32(C + m*N + n), w, vld1q_f32(X + k*N + n)));
-        }
-}
-
 #endif // !USE_SME2
 
 // ============================================================
@@ -723,46 +673,72 @@ static float forward(Model *m, Cache *c) {
                 }
         }
 #else
-        for (int t = 0; t < slen; t++) {
-            linear(c->Q[b][t], (float*)m->Wq, c->norm1[b][t], D_MODEL, D_MODEL);
-            linear(c->K[b][t], (float*)m->Wk, c->norm1[b][t], D_MODEL, D_MODEL);
-            linear(c->V[b][t], (float*)m->Wv, c->norm1[b][t], D_MODEL, D_MODEL);
+        {
+            int t = 0;
+            for (; t + 1 < slen; t += 2) {
+                linear_2(c->Q[b][t], c->Q[b][t+1], (float*)m->Wq, c->norm1[b][t], c->norm1[b][t+1], D_MODEL, D_MODEL);
+                linear_2(c->K[b][t], c->K[b][t+1], (float*)m->Wk, c->norm1[b][t], c->norm1[b][t+1], D_MODEL, D_MODEL);
+                linear_2(c->V[b][t], c->V[b][t+1], (float*)m->Wv, c->norm1[b][t], c->norm1[b][t+1], D_MODEL, D_MODEL);
+            }
+            if (t < slen) {
+                linear(c->Q[b][t], (float*)m->Wq, c->norm1[b][t], D_MODEL, D_MODEL);
+                linear(c->K[b][t], (float*)m->Wk, c->norm1[b][t], D_MODEL, D_MODEL);
+                linear(c->V[b][t], (float*)m->Wv, c->norm1[b][t], D_MODEL, D_MODEL);
+            }
         }
 #endif
 
-        // 5. Multi-head causal attention
+        // 5. Multi-head causal attention (fused: QK dots + softmax + V weighted sum)
         for (int h = 0; h < N_HEADS; h++) {
             int hoff = h * HEAD_DIM;
             for (int t = 0; t < slen; t++) {
+                // QK dot products + find max
+                float max_score = -1e30f;
 #if HEAD_DIM == 4
                 float32x4_t qt = vld1q_f32(&c->Q[b][t][hoff]);
                 for (int s = 0; s <= t; s++) {
                     float32x4_t ks = vld1q_f32(&c->K[b][s][hoff]);
-                    c->attn_scores[b][h][t][s] = vaddvq_f32(vmulq_f32(qt, ks)) * INV_SQRT_HD;
+                    float score = vaddvq_f32(vmulq_f32(qt, ks)) * INV_SQRT_HD;
+                    c->attn_scores[b][h][t][s] = score;
+                    if (score > max_score) max_score = score;
                 }
+                // Fused exp + V weighted sum
+                float sum = 0.0f;
+                float32x4_t vacc = vdupq_n_f32(0.0f);
+                for (int s = 0; s <= t; s++) {
+                    float e = fast_expf_s(c->attn_scores[b][h][t][s] - max_score);
+                    c->attn_scores[b][h][t][s] = e;
+                    sum += e;
+                    vacc = vfmaq_n_f32(vacc, vld1q_f32(&c->V[b][s][hoff]), e);
+                }
+                // Normalize
+                float inv_sum = 1.0f / sum;
+                for (int s = 0; s <= t; s++)
+                    c->attn_scores[b][h][t][s] *= inv_sum;
+                vst1q_f32(&c->attn_out[b][t][hoff], vmulq_n_f32(vacc, inv_sum));
 #else
                 for (int s = 0; s <= t; s++) {
                     float score = 0.0f;
                     for (int d = 0; d < HEAD_DIM; d++)
                         score += c->Q[b][t][hoff + d] * c->K[b][s][hoff + d];
-                    c->attn_scores[b][h][t][s] = score * INV_SQRT_HD;
+                    score *= INV_SQRT_HD;
+                    c->attn_scores[b][h][t][s] = score;
+                    if (score > max_score) max_score = score;
                 }
-#endif
-                for (int s = t + 1; s < MAX_SEQ; s++)
-                    c->attn_scores[b][h][t][s] = -1e9f;
-                softmax(c->attn_scores[b][h][t], c->attn_scores[b][h][t], MAX_SEQ);
-#if HEAD_DIM == 4
-                float32x4_t acc = vdupq_n_f32(0.0f);
+                float sum = 0.0f;
+                for (int d = 0; d < HEAD_DIM; d++) c->attn_out[b][t][hoff + d] = 0.0f;
+                for (int s = 0; s <= t; s++) {
+                    float e = fast_expf_s(c->attn_scores[b][h][t][s] - max_score);
+                    c->attn_scores[b][h][t][s] = e;
+                    sum += e;
+                    for (int d = 0; d < HEAD_DIM; d++)
+                        c->attn_out[b][t][hoff + d] += e * c->V[b][s][hoff + d];
+                }
+                float inv_sum = 1.0f / sum;
                 for (int s = 0; s <= t; s++)
-                    acc = vfmaq_n_f32(acc, vld1q_f32(&c->V[b][s][hoff]), c->attn_scores[b][h][t][s]);
-                vst1q_f32(&c->attn_out[b][t][hoff], acc);
-#else
-                for (int d = 0; d < HEAD_DIM; d++) {
-                    float sum = 0.0f;
-                    for (int s = 0; s <= t; s++)
-                        sum += c->attn_scores[b][h][t][s] * c->V[b][s][hoff + d];
-                    c->attn_out[b][t][hoff + d] = sum;
-                }
+                    c->attn_scores[b][h][t][s] *= inv_sum;
+                for (int d = 0; d < HEAD_DIM; d++)
+                    c->attn_out[b][t][hoff + d] *= inv_sum;
 #endif
             }
         }
@@ -780,8 +756,15 @@ static float forward(Model *m, Cache *c) {
                     c->res1[b][t][d] = c->emb[b][t][d] + O_T[d][t];
         }
 #else
-        for (int t = 0; t < slen; t++)
-            linear_residual(c->res1[b][t], c->emb[b][t], (float*)m->Wo, c->attn_out[b][t], D_MODEL, D_MODEL);
+        {
+            int t = 0;
+            for (; t + 1 < slen; t += 2)
+                linear_residual_2(c->res1[b][t], c->emb[b][t],
+                                  c->res1[b][t+1], c->emb[b][t+1],
+                                  (float*)m->Wo, c->attn_out[b][t], c->attn_out[b][t+1], D_MODEL, D_MODEL);
+            if (t < slen)
+                linear_residual(c->res1[b][t], c->emb[b][t], (float*)m->Wo, c->attn_out[b][t], D_MODEL, D_MODEL);
+        }
 #endif
 
         // 7. RMS norm (pre-FFN)
@@ -834,9 +817,17 @@ static float forward(Model *m, Cache *c) {
 #endif
 
         // 9. LM head + softmax
-        for (int t = 0; t < slen; t++) {
-            linear(c->logits[b][t], (float*)m->Wlm, c->res2[b][t], VOCAB, D_MODEL);
-            softmax(c->probs[b][t], c->logits[b][t], VOCAB);
+        {
+            int t = 0;
+            for (; t + 1 < slen; t += 2) {
+                linear_2(c->logits[b][t], c->logits[b][t+1], (float*)m->Wlm, c->res2[b][t], c->res2[b][t+1], VOCAB, D_MODEL);
+                softmax(c->probs[b][t], c->logits[b][t], VOCAB);
+                softmax(c->probs[b][t+1], c->logits[b][t+1], VOCAB);
+            }
+            if (t < slen) {
+                linear(c->logits[b][t], (float*)m->Wlm, c->res2[b][t], VOCAB, D_MODEL);
+                softmax(c->probs[b][t], c->logits[b][t], VOCAB);
+            }
         }
     }
 
@@ -1099,13 +1090,18 @@ static void backward(Model *m, Cache *c, Grads *g) {
             }
         }
 #else
-        // ---- Scalar backward: fused per-position (Phase 1+2 merged) ----
-        // After attention backward at position t, dQ[t]/dK[t]/dV[t] are finalized.
-        // We immediately compute weight grads and norm backward, eliminating
-        // intermediate arrays and improving cache locality.
+        // ---- Scalar backward: two-pass with register-accumulator weight grads ----
+        // Pass 1: LM head + FFN backward + attention backward (sequential)
+        // Pass 2: Weight grads with register accumulators (eliminates per-position load/stores)
+        // Pass 3: QKV input grads + norm backward + emb backward
         {
+            float dx_all[MAX_SEQ][D_MODEL];
+            float dff_out_all[MAX_SEQ][D_MODEL];
+            float dff_hidden_all[MAX_SEQ][D_FF];
+
+            // --- Pass 1: input grad projections + attention backward ---
             for (int t = slen - 2; t >= 0; t--) {
-                // --- LM head backward ---
+                // LM head backward (including Wlm weight grads)
                 float dlogits[VOCAB];
                 int target = c->tokens[b][t + 1];
                 for (int v = 0; v < VOCAB; v++)
@@ -1123,11 +1119,10 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     }
                 }
 
-                // Save dx before FFN backward for Wf2 weight grads
-                float dff_out[D_MODEL];
-                memcpy(dff_out, dx, sizeof(dx));
+                // Save dx for Wf2 weight grads
+                memcpy(dff_out_all[t], dx, sizeof(dx));
 
-                // --- FFN backward: Wf2^T (branchless) + ReLU mask ---
+                // FFN backward: Wf2^T + ReLU mask
                 float dff_hidden[D_FF];
                 linear(dff_hidden, (float*)Wf2_T, dx, D_FF, D_MODEL);
                 for (int j = 0; j < D_FF; j += 4) {
@@ -1136,8 +1131,9 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     float32x4_t dh = vld1q_f32(&dff_hidden[j]);
                     vst1q_f32(&dff_hidden[j], vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(dh), mask)));
                 }
+                memcpy(dff_hidden_all[t], dff_hidden, sizeof(dff_hidden));
 
-                // --- FFN backward: Wf1^T (dot-product via transposed weights) ---
+                // FFN backward: Wf1^T
                 float dnorm2[D_MODEL];
                 linear(dnorm2, (float*)Wf1_T, dff_hidden, D_MODEL, D_FF);
 
@@ -1158,12 +1154,13 @@ static void backward(Model *m, Cache *c, Grads *g) {
                         vst1q_f32(&dx[d], vfmsq_f32(vfmaq_f32(dxv, dn, inv_rms_v), r1, dot_s));
                     }
                 }
+                memcpy(dx_all[t], dx, sizeof(dx));
 
-                // --- O projection backward: Wo^T (dot-product via transposed weights) ---
+                // O projection backward: Wo^T
                 float dattn_out[D_MODEL];
                 linear(dattn_out, (float*)Wo_T, dx, D_MODEL, D_MODEL);
 
-                // --- Attention backward ---
+                // Attention backward
                 for (int h = 0; h < N_HEADS; h++) {
                     int hoff = h * HEAD_DIM;
                     float dattn_scores_h[MAX_SEQ];
@@ -1211,10 +1208,86 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     }
 #endif
                 }
+            }
 
-                // === Weight grads + input grads (fused, dQ[t]/dK[t]/dV[t] finalized) ===
+            // --- Pass 2: register-accumulator weight grads ---
+            // QKV weight grads: accumulate across all positions in registers
+            for (int d = 0; d < D_MODEL; d++) {
+                float32x4_t aq[D_MODEL/4], ak[D_MODEL/4], av[D_MODEL/4];
+                for (int k = 0; k < D_MODEL/4; k++) {
+                    aq[k] = vld1q_f32(&g->Wq[d][k*4]);
+                    ak[k] = vld1q_f32(&g->Wk[d][k*4]);
+                    av[k] = vld1q_f32(&g->Wv[d][k*4]);
+                }
+                for (int t = 0; t < slen - 1; t++) {
+                    float32x4_t dq = vdupq_n_f32(dQ[t][d]);
+                    float32x4_t dk = vdupq_n_f32(dK[t][d]);
+                    float32x4_t dv = vdupq_n_f32(dV[t][d]);
+                    for (int k = 0; k < D_MODEL/4; k++) {
+                        float32x4_t n1 = vld1q_f32(&c->norm1[b][t][k*4]);
+                        aq[k] = vfmaq_f32(aq[k], dq, n1);
+                        ak[k] = vfmaq_f32(ak[k], dk, n1);
+                        av[k] = vfmaq_f32(av[k], dv, n1);
+                    }
+                }
+                for (int k = 0; k < D_MODEL/4; k++) {
+                    vst1q_f32(&g->Wq[d][k*4], aq[k]);
+                    vst1q_f32(&g->Wk[d][k*4], ak[k]);
+                    vst1q_f32(&g->Wv[d][k*4], av[k]);
+                }
+            }
 
-                // QKV weight grads + input grads
+            // Wo weight grads
+            for (int d = 0; d < D_MODEL; d++) {
+                float32x4_t aw[D_MODEL/4];
+                for (int k = 0; k < D_MODEL/4; k++)
+                    aw[k] = vld1q_f32(&g->Wo[d][k*4]);
+                for (int t = 0; t < slen - 1; t++) {
+                    float32x4_t dx_d = vdupq_n_f32(dx_all[t][d]);
+                    for (int k = 0; k < D_MODEL/4; k++)
+                        aw[k] = vfmaq_f32(aw[k], dx_d, vld1q_f32(&c->attn_out[b][t][k*4]));
+                }
+                for (int k = 0; k < D_MODEL/4; k++)
+                    vst1q_f32(&g->Wo[d][k*4], aw[k]);
+            }
+
+            // Wf2 weight grads: tile D_FF in groups of 16
+            for (int d = 0; d < D_MODEL; d++) {
+                for (int j0 = 0; j0 < D_FF; j0 += 16) {
+                    float32x4_t a0 = vld1q_f32(&g->Wf2[d][j0]);
+                    float32x4_t a1 = vld1q_f32(&g->Wf2[d][j0+4]);
+                    float32x4_t a2 = vld1q_f32(&g->Wf2[d][j0+8]);
+                    float32x4_t a3 = vld1q_f32(&g->Wf2[d][j0+12]);
+                    for (int t = 0; t < slen - 1; t++) {
+                        float32x4_t df = vdupq_n_f32(dff_out_all[t][d]);
+                        a0 = vfmaq_f32(a0, df, vld1q_f32(&c->ff_hidden[b][t][j0]));
+                        a1 = vfmaq_f32(a1, df, vld1q_f32(&c->ff_hidden[b][t][j0+4]));
+                        a2 = vfmaq_f32(a2, df, vld1q_f32(&c->ff_hidden[b][t][j0+8]));
+                        a3 = vfmaq_f32(a3, df, vld1q_f32(&c->ff_hidden[b][t][j0+12]));
+                    }
+                    vst1q_f32(&g->Wf2[d][j0], a0);
+                    vst1q_f32(&g->Wf2[d][j0+4], a1);
+                    vst1q_f32(&g->Wf2[d][j0+8], a2);
+                    vst1q_f32(&g->Wf2[d][j0+12], a3);
+                }
+            }
+
+            // Wf1 weight grads
+            for (int j = 0; j < D_FF; j++) {
+                float32x4_t aw[D_MODEL/4];
+                for (int k = 0; k < D_MODEL/4; k++)
+                    aw[k] = vld1q_f32(&g->Wf1[j][k*4]);
+                for (int t = 0; t < slen - 1; t++) {
+                    float32x4_t dh = vdupq_n_f32(dff_hidden_all[t][j]);
+                    for (int k = 0; k < D_MODEL/4; k++)
+                        aw[k] = vfmaq_f32(aw[k], dh, vld1q_f32(&c->norm2[b][t][k*4]));
+                }
+                for (int k = 0; k < D_MODEL/4; k++)
+                    vst1q_f32(&g->Wf1[j][k*4], aw[k]);
+            }
+
+            // --- Pass 3: QKV input grads + norm backward + emb backward ---
+            for (int t = slen - 2; t >= 0; t--) {
                 float dnorm1[D_MODEL];
                 memset(dnorm1, 0, sizeof(dnorm1));
 #if HEAD_DIM == 4
@@ -1223,10 +1296,6 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     float32x4_t dk_d = vdupq_n_f32(dK[t][d]);
                     float32x4_t dv_d = vdupq_n_f32(dV[t][d]);
                     for (int i = 0; i < D_MODEL; i += 4) {
-                        float32x4_t n1 = vld1q_f32(&c->norm1[b][t][i]);
-                        vst1q_f32(&g->Wq[d][i], vfmaq_f32(vld1q_f32(&g->Wq[d][i]), dq_d, n1));
-                        vst1q_f32(&g->Wk[d][i], vfmaq_f32(vld1q_f32(&g->Wk[d][i]), dk_d, n1));
-                        vst1q_f32(&g->Wv[d][i], vfmaq_f32(vld1q_f32(&g->Wv[d][i]), dv_d, n1));
                         float32x4_t dn = vld1q_f32(&dnorm1[i]);
                         dn = vfmaq_f32(dn, vld1q_f32(&m->Wq[d][i]), dq_d);
                         dn = vfmaq_f32(dn, vld1q_f32(&m->Wk[d][i]), dk_d);
@@ -1237,41 +1306,12 @@ static void backward(Model *m, Cache *c, Grads *g) {
 #else
                 for (int d = 0; d < D_MODEL; d++) {
                     for (int i = 0; i < D_MODEL; i++) {
-                        g->Wq[d][i] += dQ[t][d] * c->norm1[b][t][i];
-                        g->Wk[d][i] += dK[t][d] * c->norm1[b][t][i];
-                        g->Wv[d][i] += dV[t][d] * c->norm1[b][t][i];
                         dnorm1[i] += m->Wq[d][i] * dQ[t][d]
                                   +  m->Wk[d][i] * dK[t][d]
                                   +  m->Wv[d][i] * dV[t][d];
                     }
                 }
 #endif
-
-                // Wo weight grads (using dx which = do_proj)
-                for (int d = 0; d < D_MODEL; d++) {
-                    float32x4_t dx_d = vdupq_n_f32(dx[d]);
-                    for (int i = 0; i < D_MODEL; i += 4)
-                        vst1q_f32(&g->Wo[d][i], vfmaq_f32(vld1q_f32(&g->Wo[d][i]), dx_d, vld1q_f32(&c->attn_out[b][t][i])));
-                }
-
-                // Wf2 weight grads (using dff_out = dx before FFN backward)
-                for (int d = 0; d < D_MODEL; d++) {
-                    float32x4_t dfo_d = vdupq_n_f32(dff_out[d]);
-                    for (int j = 0; j < D_FF; j += 4)
-                        vst1q_f32(&g->Wf2[d][j], vfmaq_f32(vld1q_f32(&g->Wf2[d][j]), dfo_d, vld1q_f32(&c->ff_hidden[b][t][j])));
-                }
-
-                // Wf1 weight grads
-                for (int j = 0; j < D_FF; j++) {
-                    float32x4_t dh_j = vdupq_n_f32(dff_hidden[j]);
-                    for (int d = 0; d < D_MODEL; d += 4)
-                        vst1q_f32(&g->Wf1[j][d], vfmaq_f32(vld1q_f32(&g->Wf1[j][d]), dh_j, vld1q_f32(&c->norm2[b][t][d])));
-                }
-
-                // Clear dQ/dK/dV for next batch item
-                memset(dQ[t], 0, D_MODEL * sizeof(float));
-                memset(dK[t], 0, D_MODEL * sizeof(float));
-                memset(dV[t], 0, D_MODEL * sizeof(float));
 
                 // Norm1 backward
                 float demb[D_MODEL];
@@ -1293,7 +1333,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
 
                 // Residual connection
                 for (int d = 0; d < D_MODEL; d += 4)
-                    vst1q_f32(&demb[d], vaddq_f32(vld1q_f32(&demb[d]), vld1q_f32(&dx[d])));
+                    vst1q_f32(&demb[d], vaddq_f32(vld1q_f32(&demb[d]), vld1q_f32(&dx_all[t][d])));
 
                 // Emb RMS norm backward
                 float dtmp[D_MODEL];
