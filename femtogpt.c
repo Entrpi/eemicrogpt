@@ -527,9 +527,28 @@ static void sme2_qkv_input_grad(
 #if !USE_SME2
 
 // C[M][N] = W[M][K] @ X[K][N]  (W in standard row-major)
+// When N=16, keeps accumulators in registers across K loop (eliminates C load/stores)
 static inline __attribute__((always_inline)) void neon_matmul(
     float *C, const float *W, const float *X, int M, int K, int N
 ) {
+#if MAX_SEQ == 16
+    if (N == 16) {
+        for (int m = 0; m < M; m++) {
+            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+            float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+            for (int k = 0; k < K; k++) {
+                float32x4_t w = vdupq_n_f32(W[m * K + k]);
+                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*16));
+                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*16 + 4));
+                a2 = vfmaq_f32(a2, w, vld1q_f32(X + k*16 + 8));
+                a3 = vfmaq_f32(a3, w, vld1q_f32(X + k*16 + 12));
+            }
+            vst1q_f32(C + m*16,     a0); vst1q_f32(C + m*16 + 4,  a1);
+            vst1q_f32(C + m*16 + 8, a2); vst1q_f32(C + m*16 + 12, a3);
+        }
+        return;
+    }
+#endif
     memset(C, 0, M * N * sizeof(float));
     for (int m = 0; m < M; m++)
         for (int k = 0; k < K; k++) {
