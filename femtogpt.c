@@ -314,12 +314,7 @@ static inline __attribute__((always_inline)) void softmax(float *out, const floa
     for (int i = 0; i < n; i++) out[i] *= inv_sum;
 }
 
-// ============================================================
-// SME2 FMOPA matmul functions (generalized for any D_MODEL multiple of 16)
-// ============================================================
-#if USE_SME2
-
-// Transposed weight copies for FMOPA (contiguous column access).
+// Transposed weight copies for backward dot-product matvecs (and SME2 FMOPA).
 // Maintained outside Model struct so Adam doesn't touch them.
 static float Wq_T[D_MODEL][D_MODEL];
 static float Wk_T[D_MODEL][D_MODEL];
@@ -343,6 +338,11 @@ static void sync_transposed_weights(Model *m) {
         for (int j = 0; j < D_FF; j++)
             Wf2_T[j][i] = m->Wf2[i][j];
 }
+
+// ============================================================
+// SME2 FMOPA matmul functions (generalized for any D_MODEL multiple of 16)
+// ============================================================
+#if USE_SME2
 
 // C[M][16] = W_T[K][M] @ X[K][16] using tiled FMOPA
 // FMOPA: ZA[i][j] += left[i] * right[j]
@@ -791,6 +791,9 @@ static float forward(Model *m, Cache *c) {
 // ============================================================
 static void backward(Model *m, Cache *c, Grads *g) {
     memset(g, 0, sizeof(Grads));
+#if !USE_SME2
+    sync_transposed_weights(m);
+#endif
 
     int total_count = 0;
     for (int b = 0; b < BATCH; b++)
@@ -1053,28 +1056,17 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 float dff_out[D_MODEL];
                 memcpy(dff_out, dx, sizeof(dx));
 
-                // --- FFN backward: Wf2^T ---
+                // --- FFN backward: Wf2^T (dot-product via transposed weights) ---
                 float dff_hidden[D_FF];
-                memset(dff_hidden, 0, sizeof(dff_hidden));
-                for (int d = 0; d < D_MODEL; d++) {
-                    float32x4_t dx_d = vdupq_n_f32(dx[d]);
-                    for (int j = 0; j < D_FF; j += 4)
-                        vst1q_f32(&dff_hidden[j], vfmaq_f32(vld1q_f32(&dff_hidden[j]), dx_d, vld1q_f32(&m->Wf2[d][j])));
-                }
+                linear(dff_hidden, (float*)Wf2_T, dx, D_FF, D_MODEL);
 
                 // ReLU backward
                 for (int j = 0; j < D_FF; j++)
                     if (c->ff_pre_relu[b][t][j] <= 0.0f) dff_hidden[j] = 0.0f;
 
-                // --- FFN backward: Wf1^T ---
+                // --- FFN backward: Wf1^T (dot-product via transposed weights) ---
                 float dnorm2[D_MODEL];
-                memset(dnorm2, 0, sizeof(dnorm2));
-                for (int j = 0; j < D_FF; j++) {
-                    if (dff_hidden[j] == 0.0f) continue;
-                    float32x4_t dh_j = vdupq_n_f32(dff_hidden[j]);
-                    for (int d = 0; d < D_MODEL; d += 4)
-                        vst1q_f32(&dnorm2[d], vfmaq_f32(vld1q_f32(&dnorm2[d]), dh_j, vld1q_f32(&m->Wf1[j][d])));
-                }
+                linear(dnorm2, (float*)Wf1_T, dff_hidden, D_MODEL, D_FF);
 
                 // Norm2 backward → update dx
                 {
@@ -1094,14 +1086,9 @@ static void backward(Model *m, Cache *c, Grads *g) {
                     }
                 }
 
-                // --- O projection backward: Wo^T ---
+                // --- O projection backward: Wo^T (dot-product via transposed weights) ---
                 float dattn_out[D_MODEL];
-                memset(dattn_out, 0, sizeof(dattn_out));
-                for (int d = 0; d < D_MODEL; d++) {
-                    float32x4_t dx_d = vdupq_n_f32(dx[d]);
-                    for (int i = 0; i < D_MODEL; i += 4)
-                        vst1q_f32(&dattn_out[i], vfmaq_f32(vld1q_f32(&dattn_out[i]), dx_d, vld1q_f32(&m->Wo[d][i])));
-                }
+                linear(dattn_out, (float*)Wo_T, dx, D_MODEL, D_MODEL);
 
                 // --- Attention backward ---
                 for (int h = 0; h < N_HEADS; h++) {
@@ -1432,9 +1419,7 @@ int main(int argc, char **argv) {
 
     init_model(model);
 
-#if USE_SME2
     sync_transposed_weights(model);
-#endif
 
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
