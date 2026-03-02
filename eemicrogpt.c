@@ -1,9 +1,13 @@
-// FemtoGPT: A tiny GPT trained from scratch in C with SME2/Neon on Apple M5
-// Single-file implementation: 1-layer transformer, character-level name generation
-// Architecture matches AttoGPT: https://gist.github.com/JGalego/26d617e5c939af0c32f3c16e4e392803
+/*
+Everything else is just efficiency.
+The most extreme way to train a GPT in pure, dependency-free C.
+This file is the everything else.
+Optimized for Apple Silicon with SME2 (M4+), with scalar Neon fallback.
+@entgpt
+*/
 //
-// Compile (without SME2): clang -O3 -ffast-math -o femtogpt femtogpt.c -lm
-// Compile (with SME2):    clang -O3 -mcpu=native+sme2 -ffast-math -o femtogpt femtogpt.c -lm
+// Compile (scalar):  clang -O3 -ffast-math -o eemicrogpt eemicrogpt.c -lm
+// Compile (SME2):    clang -O3 -mcpu=native+sme2 -ffast-math -o eemicrogpt eemicrogpt.c -lm
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1655,6 +1659,8 @@ int main(int argc, char **argv) {
     uint64_t t_fwd_total = 0, t_bwd_total = 0, t_adam_total = 0;
 
     uint64_t t_start = mach_absolute_time();
+    float loss_sum = 0.0f;
+    float loss_buf[100] = {0};
 
     for (int step = 1; step <= N_STEPS; step++) {
         // Sample batch
@@ -1686,8 +1692,15 @@ int main(int argc, char **argv) {
         t_bwd_total += (t2 - t1);
         t_adam_total += (t3 - t2);
 
-        if (step % 10 == 0 || step == 1) {
-            printf("Step %3d/%d  loss=%.4f  lr=%.6f\n", step, N_STEPS, loss, lr);
+        // Rolling 100-step loss buffer
+        loss_buf[(step - 1) % 100] = loss;
+        if (step % 1000 == 0) {
+            float avg = 0.0f;
+            int n = step < 100 ? step : 100;
+            for (int i = 0; i < n; i++) avg += loss_buf[i];
+            uint64_t t_now = mach_absolute_time();
+            double ms = (double)((t_now - t_start) * tb.numer / tb.denom) / 1e6;
+            printf("Step %5d  avg_loss(100)=%.4f  elapsed=%.0fms\n", step, avg / n, ms);
         }
     }
 
@@ -1696,8 +1709,13 @@ int main(int argc, char **argv) {
     double elapsed_us = (double)elapsed_ns / 1000.0;
     double elapsed_ms = elapsed_us / 1000.0;
 
+    int tail = N_STEPS >= 100 ? 100 : N_STEPS;
+    float final_avg = 0.0f;
+    for (int i = 0; i < tail; i++) final_avg += loss_buf[i];
+    final_avg /= tail;
     printf("\nTraining complete in %.2f ms (%.1f us)\n", elapsed_ms, elapsed_us);
     printf("Average step: %.2f us\n", elapsed_us / N_STEPS);
+    printf("Avg loss (last %d): %.4f\n", tail, final_avg);
 
     // Component timing breakdown
     double fwd_us = (double)t_fwd_total * (double)tb.numer / (double)tb.denom / 1000.0;
