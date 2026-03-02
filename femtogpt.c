@@ -249,6 +249,21 @@ static inline __attribute__((always_inline)) void linear_residual(
     }
 }
 
+// Fused linear + ReLU: pre_relu[j] = W@x, hidden[j] = max(0, pre_relu[j])
+static inline __attribute__((always_inline)) void linear_relu(
+    float *pre_relu, float *hidden, const float *W, const float *x, int out_dim, int in_dim
+) {
+    for (int j = 0; j < out_dim; j++) {
+        float32x4_t acc = vdupq_n_f32(0);
+        const float *row = W + j * in_dim;
+        for (int i = 0; i < in_dim; i += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(row + i), vld1q_f32(x + i));
+        float val = vaddvq_f32(acc);
+        pre_relu[j] = val;
+        hidden[j] = val > 0.0f ? val : 0.0f;
+    }
+}
+
 // Fast vectorized exp approximation (relative error ~1e-4, sufficient for softmax)
 // Uses exp(x) = exp2(x * log2(e)) with polynomial refinement
 static inline float32x4_t fast_expq_f32(float32x4_t x) {
@@ -754,9 +769,7 @@ static float forward(Model *m, Cache *c) {
         }
 #else
         for (int t = 0; t < slen; t++) {
-            linear(c->ff_pre_relu[b][t], (float*)m->Wf1, c->norm2[b][t], D_FF, D_MODEL);
-            for (int j = 0; j < D_FF; j++)
-                c->ff_hidden[b][t][j] = c->ff_pre_relu[b][t][j] > 0.0f ? c->ff_pre_relu[b][t][j] : 0.0f;
+            linear_relu(c->ff_pre_relu[b][t], c->ff_hidden[b][t], (float*)m->Wf1, c->norm2[b][t], D_FF, D_MODEL);
             linear_residual(c->res2[b][t], c->res1[b][t], (float*)m->Wf2, c->ff_hidden[b][t], D_MODEL, D_FF);
         }
 #endif
@@ -1043,7 +1056,6 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 float dx[D_MODEL];
                 memset(dx, 0, sizeof(dx));
                 for (int v = 0; v < VOCAB; v++) {
-                    if (dlogits[v] == 0.0f) continue;
                     float32x4_t dl_v = vdupq_n_f32(dlogits[v]);
                     for (int d = 0; d < D_MODEL; d += 4) {
                         float32x4_t r2 = vld1q_f32(&c->res2[b][t][d]);
@@ -1056,13 +1068,16 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 float dff_out[D_MODEL];
                 memcpy(dff_out, dx, sizeof(dx));
 
-                // --- FFN backward: Wf2^T (dot-product via transposed weights) ---
+                // --- FFN backward: Wf2^T + ReLU (skip dead units) ---
                 float dff_hidden[D_FF];
-                linear(dff_hidden, (float*)Wf2_T, dx, D_FF, D_MODEL);
-
-                // ReLU backward
-                for (int j = 0; j < D_FF; j++)
-                    if (c->ff_pre_relu[b][t][j] <= 0.0f) dff_hidden[j] = 0.0f;
+                for (int j = 0; j < D_FF; j++) {
+                    if (c->ff_pre_relu[b][t][j] <= 0.0f) { dff_hidden[j] = 0.0f; continue; }
+                    float32x4_t acc = vdupq_n_f32(0);
+                    const float *row = (float*)Wf2_T + j * D_MODEL;
+                    for (int i = 0; i < D_MODEL; i += 4)
+                        acc = vfmaq_f32(acc, vld1q_f32(row + i), vld1q_f32(dx + i));
+                    dff_hidden[j] = vaddvq_f32(acc);
+                }
 
                 // --- FFN backward: Wf1^T (dot-product via transposed weights) ---
                 float dnorm2[D_MODEL];
@@ -1190,7 +1205,6 @@ static void backward(Model *m, Cache *c, Grads *g) {
 
                 // Wf1 weight grads
                 for (int j = 0; j < D_FF; j++) {
-                    if (dff_hidden[j] == 0.0f) continue;
                     float32x4_t dh_j = vdupq_n_f32(dff_hidden[j]);
                     for (int d = 0; d < D_MODEL; d += 4)
                         vst1q_f32(&g->Wf1[j][d], vfmaq_f32(vld1q_f32(&g->Wf1[j][d]), dh_j, vld1q_f32(&c->norm2[b][t][d])));
@@ -1261,7 +1275,28 @@ static void adam_update(float *param, float *grad, float *m1, float *m2,
     float beta1_corr = 1.0f - powf(BETA1, (float)step);
     float beta2_corr = 1.0f - powf(BETA2, (float)step);
 
-    for (int i = 0; i < n; i++) {
+    float32x4_t vb1 = vdupq_n_f32(BETA1);
+    float32x4_t vb1c = vdupq_n_f32(1.0f - BETA1);
+    float32x4_t vb2 = vdupq_n_f32(BETA2);
+    float32x4_t vb2c = vdupq_n_f32(1.0f - BETA2);
+    float32x4_t vlr_b1 = vdupq_n_f32(lr / beta1_corr);
+    float32x4_t vinv_b2 = vdupq_n_f32(1.0f / beta2_corr);
+    float32x4_t veps = vdupq_n_f32(EPS);
+
+    int i;
+    for (i = 0; i + 3 < n; i += 4) {
+        float32x4_t g = vld1q_f32(grad + i);
+        float32x4_t vm1 = vfmaq_f32(vmulq_f32(vb1, vld1q_f32(m1 + i)), vb1c, g);
+        float32x4_t vm2 = vfmaq_f32(vmulq_f32(vb2, vld1q_f32(m2 + i)), vb2c, vmulq_f32(g, g));
+        vst1q_f32(m1 + i, vm1);
+        vst1q_f32(m2 + i, vm2);
+        // param -= lr/b1_corr * m1 / (sqrt(m2/b2_corr) + eps)
+        float32x4_t m2h = vmulq_f32(vm2, vinv_b2);
+        float32x4_t denom = vaddq_f32(vsqrtq_f32(m2h), veps);
+        float32x4_t p = vld1q_f32(param + i);
+        vst1q_f32(param + i, vfmsq_f32(p, vlr_b1, vdivq_f32(vm1, denom)));
+    }
+    for (; i < n; i++) {
         m1[i] = BETA1 * m1[i] + (1.0f - BETA1) * grad[i];
         m2[i] = BETA2 * m2[i] + (1.0f - BETA2) * grad[i] * grad[i];
         float m1_hat = m1[i] / beta1_corr;
