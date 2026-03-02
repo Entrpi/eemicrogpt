@@ -80,28 +80,30 @@ d32 hits the sweet spot: enough capacity to learn well, small enough to run thou
 
 ### Work-equivalent comparison (per training sample, same architecture)
 
-All implementations train the exact same model on the same data. CPython and PyPy run Karpathy's microgpt.py; [microgpt.cpp](https://github.com/Charbel199/microgpt.cpp) is the fastest known C/C++ port. All three use the autograd `Value` class approach with batch=1 and double precision. EEmicroGPT uses explicit forward/backward, batch=16, float.
+All implementations train the exact same model on the same data. CPython, PyPy, and [microgpt.cpp](https://github.com/Charbel199/microgpt.cpp) use the autograd `Value` class approach with batch=1 and f64. [rust-microgpt](https://github.com/mplekh/rust-microgpt) uses the same autograd approach with batch=1 but f32. EEmicroGPT uses explicit forward/backward, batch=16, f32.
 
 **d16 (n_embd=16, block_size=16, 10K training samples):**
 
 | Implementation | Wall time | us/sample | Speedup |
 |---|---|---|---|
-| CPython 3.14 (batch=1) | 490s | 49,000 | 1x |
-| PyPy 7.3.17 (batch=1) | 176.4s | 17,640 | 2.8x |
-| microgpt.cpp (batch=1) | 2.70s | 270 | 181x |
-| EEmicroGPT (batch=16) | 0.030s | 3.0 | **16,333x** |
+| CPython 3.14 | 490s | 49,000 | 1x |
+| PyPy 7.3.17 | 176.4s | 17,640 | 2.8x |
+| microgpt.cpp | 2.70s | 270 | 181x |
+| rust-microgpt | 1.18s | 118 | 415x |
+| **EEmicroGPT** | **0.030s** | **3.0** | **16,333x** |
 
 **d64 (n_embd=64, block_size=16, 1K training samples):**
 
 | Implementation | Wall time | us/sample | Speedup |
 |---|---|---|---|
-| CPython 3.14 (batch=1) | 713s | 713,200 | 1x |
-| PyPy 7.3.17 (batch=1) | 301.4s | 301,400 | 2.4x |
-| microgpt.cpp (batch=1) | 3.26s | 3,260 | 219x |
-| EEmicroGPT scalar (batch=16) | 0.047s | 46.8 | 15,239x |
-| EEmicroGPT SME2 (batch=16) | 0.037s | 36.8 | **19,380x** |
+| CPython 3.14 | 713s | 713,200 | 1x |
+| PyPy 7.3.17 | 301.4s | 301,400 | 2.4x |
+| microgpt.cpp | 3.26s | 3,260 | 219x |
+| rust-microgpt | 1.62s | 1,620 | 440x |
+| EEmicroGPT scalar | 0.047s | 46.8 | 15,239x |
+| **EEmicroGPT SME2** | **0.037s** | **36.8** | **19,380x** |
 
-~90x faster than microgpt.cpp at both sizes. The gap comes from batched GEMM (16 samples amortize weight loads), float vs double, explicit gradients (no autograd graph), and Neon/SME2 SIMD.
+~44x faster than rust-microgpt (the fastest autograd implementation) at both sizes. The gap comes from batched GEMM (16 samples amortize weight loads), float vs double, explicit gradients (no autograd graph), and Neon/SME2 SIMD.
 
 ## Why this likely beats a $40K GPU
 
