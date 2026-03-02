@@ -5,7 +5,7 @@
 
 **This file is the everything else.**
 
-EEmicroGPT is a single-file, dependency-free C implementation of GPT training — forward pass, backward pass, Adam optimizer, and autoregressive generation — optimized from the ground up for Apple Silicon. It trains a character-level name generator on the same architecture and dataset as Karpathy's microgpt.py, producing identical learning dynamics at **864–1385x the speed**.
+EEmicroGPT is a single-file, dependency-free C implementation of GPT training — forward pass, backward pass, Adam optimizer, and autoregressive generation — optimized from the ground up for Apple Silicon. It trains a character-level name generator on the same architecture and dataset as Karpathy's microgpt.py, producing identical learning dynamics **up to 19,000x faster** per training sample.
 
 The name stands for "Everything Else" (or "Extreme Efficiency") — the half of the equation that microgpt.py intentionally leaves on the table.
 
@@ -53,18 +53,18 @@ The forward pass: `embed → rms_norm → rms_norm → QKV → causal attention 
 
 ## Performance
 
-All benchmarks on Apple M5, single P-core. Python reference is microgpt.py (autograd `Value` class, batch=1).
+All benchmarks on Apple M5, single P-core.
 
 ### bpc@1s: best quality within ~1 second of training (batch=16)
 
-| d_model | backend | us/step | steps/1s | loss | vs Python |
-|---------|---------|---------|----------|------|-----------|
-| 16 | scalar | 57.1 | 16,700 | 2.0869 | **858x** |
-| 32 | scalar | 181 | 5,150 | **2.0747** | **1045x** |
-| 64 | scalar | 832 | 1,100 | 2.1384 | 858x |
-| 64 | SME2 | 589 | 1,700 | 2.0974 | **1211x** |
-| 128 | scalar | 4,779 | 220 | 2.2633 | 600x |
-| 128 | SME2 | 1,904 | 545 | 2.1645 | **1506x** |
+| d_model | backend | us/step | steps/1s | loss |
+|---------|---------|---------|----------|------|
+| 16 | scalar | 57.1 | 16,700 | 2.0869 |
+| 32 | scalar | 181 | 5,150 | **2.0747** |
+| 64 | scalar | 832 | 1,100 | 2.1384 |
+| 64 | SME2 | 589 | 1,700 | 2.0974 |
+| 128 | scalar | 4,779 | 220 | 2.2633 |
+| 128 | SME2 | 1,904 | 545 | 2.1645 |
 
 **Winner: d32 scalar at LR=0.007 → loss 2.0747**
 
@@ -78,16 +78,30 @@ d32 hits the sweet spot: enough capacity to learn well, small enough to run thou
 | 32 | 500k | 0.002 | 1.92 |
 | 64 (SME2) | 1M | 0.0007 | 1.74 (~10 min wall time) |
 
-### Python baseline reference
+### Work-equivalent comparison (per training sample, same architecture)
 
-| d_model | Python ms/step | EEmicroGPT us/step | Speedup |
-|---------|---------------|-------------------|---------|
-| 16 | 49.0 | 0.0567 | 864x |
-| 32 | 189.3 | 0.182 | 1040x |
-| 64 | 713.2 | 0.582 (SME2) | **1225x** |
-| 128 | 2867.1 | 1.855 (SME2) | **1546x** |
+All implementations train the exact same model on the same data. CPython and PyPy run Karpathy's microgpt.py; [microgpt.cpp](https://github.com/Charbel199/microgpt.cpp) is the fastest known C/C++ port. All three use the autograd `Value` class approach with batch=1 and double precision. EEmicroGPT uses explicit forward/backward, batch=16, float.
 
-The speedup grows with model size because Python's per-operation overhead is constant while C's batched GEMM scales efficiently. The SME2 path benefits from fused streaming-mode backward (see optimization #10), which reduced d64 by 19% and d128 by 29%.
+**d16 (n_embd=16, block_size=16, 10K training samples):**
+
+| Implementation | Wall time | us/sample | Speedup |
+|---|---|---|---|
+| CPython 3.14 (batch=1) | 490s | 49,000 | 1x |
+| PyPy 7.3.17 (batch=1) | 176.4s | 17,640 | 2.8x |
+| microgpt.cpp (batch=1) | 2.70s | 270 | 181x |
+| EEmicroGPT (batch=16) | 0.030s | 3.0 | **16,333x** |
+
+**d64 (n_embd=64, block_size=16, 1K training samples):**
+
+| Implementation | Wall time | us/sample | Speedup |
+|---|---|---|---|
+| CPython 3.14 (batch=1) | 713s | 713,200 | 1x |
+| PyPy 7.3.17 (batch=1) | 301.4s | 301,400 | 2.4x |
+| microgpt.cpp (batch=1) | 3.26s | 3,260 | 219x |
+| EEmicroGPT scalar (batch=16) | 0.047s | 46.8 | 15,239x |
+| EEmicroGPT SME2 (batch=16) | 0.037s | 36.8 | **19,380x** |
+
+~90x faster than microgpt.cpp at both sizes. The gap comes from batched GEMM (16 samples amortize weight loads), float vs double, explicit gradients (no autograd graph), and Neon/SME2 SIMD.
 
 ## Why this likely beats a $40K GPU
 
