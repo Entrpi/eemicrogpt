@@ -115,13 +115,11 @@ typedef struct {
     float  V[BATCH][MAX_SEQ][D_MODEL];
     float  attn_scores[BATCH][N_HEADS][MAX_SEQ][MAX_SEQ]; // post-softmax
     float  attn_out[BATCH][MAX_SEQ][D_MODEL];       // attention value aggregation output
-    float  o_proj[BATCH][MAX_SEQ][D_MODEL];         // after O projection
     float  res1[BATCH][MAX_SEQ][D_MODEL];           // after first residual (attn + emb)
     float  norm2[BATCH][MAX_SEQ][D_MODEL];          // after RMS norm pre-FFN
     float  norm2_rms[BATCH][MAX_SEQ];
     float  ff_pre_relu[BATCH][MAX_SEQ][D_FF];       // FFN hidden before ReLU
     float  ff_hidden[BATCH][MAX_SEQ][D_FF];         // FFN hidden after ReLU
-    float  ff_out[BATCH][MAX_SEQ][D_MODEL];         // FFN output
     float  res2[BATCH][MAX_SEQ][D_MODEL];           // after second residual (FFN + res1)
     float  logits[BATCH][MAX_SEQ][VOCAB];
     float  probs[BATCH][MAX_SEQ][VOCAB];
@@ -235,6 +233,19 @@ static inline __attribute__((always_inline)) void linear(float *y, const float *
         for (int i = 0; i < in_dim; i += 4)
             acc = vfmaq_f32(acc, vld1q_f32(row + i), vld1q_f32(x + i));
         y[j] = vaddvq_f32(acc);
+    }
+}
+
+// y[j] = base[j] + sum_i W[j][i] * x[i] — fused matvec + residual
+static inline __attribute__((always_inline)) void linear_residual(
+    float *y, const float *base, const float *W, const float *x, int out_dim, int in_dim
+) {
+    for (int j = 0; j < out_dim; j++) {
+        float32x4_t acc = vdupq_n_f32(0);
+        const float *row = W + j * in_dim;
+        for (int i = 0; i < in_dim; i += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(row + i), vld1q_f32(x + i));
+        y[j] = base[j] + vaddvq_f32(acc);
     }
 }
 
@@ -702,17 +713,12 @@ static float forward(Model *m, Cache *c) {
                     A_T[d][t] = c->attn_out[b][t][d];
             sme2_o_project((float*)O_T, (float*)A_T);
             for (int t = 0; t < slen; t++)
-                for (int d = 0; d < D_MODEL; d++) {
-                    c->o_proj[b][t][d] = O_T[d][t];
+                for (int d = 0; d < D_MODEL; d++)
                     c->res1[b][t][d] = c->emb[b][t][d] + O_T[d][t];
-                }
         }
 #else
-        for (int t = 0; t < slen; t++) {
-            linear(c->o_proj[b][t], (float*)m->Wo, c->attn_out[b][t], D_MODEL, D_MODEL);
-            for (int d = 0; d < D_MODEL; d++)
-                c->res1[b][t][d] = c->emb[b][t][d] + c->o_proj[b][t][d];
-        }
+        for (int t = 0; t < slen; t++)
+            linear_residual(c->res1[b][t], c->emb[b][t], (float*)m->Wo, c->attn_out[b][t], D_MODEL, D_MODEL);
 #endif
 
         // 7. RMS norm (pre-FFN)
@@ -743,19 +749,15 @@ static float forward(Model *m, Cache *c) {
             sme2_ffn_contract((float*)Y, (float*)H);
 
             for (int t = 0; t < slen; t++)
-                for (int d = 0; d < D_MODEL; d++) {
-                    c->ff_out[b][t][d] = Y[d][t];
+                for (int d = 0; d < D_MODEL; d++)
                     c->res2[b][t][d] = c->res1[b][t][d] + Y[d][t];
-                }
         }
 #else
         for (int t = 0; t < slen; t++) {
             linear(c->ff_pre_relu[b][t], (float*)m->Wf1, c->norm2[b][t], D_FF, D_MODEL);
             for (int j = 0; j < D_FF; j++)
                 c->ff_hidden[b][t][j] = c->ff_pre_relu[b][t][j] > 0.0f ? c->ff_pre_relu[b][t][j] : 0.0f;
-            linear(c->ff_out[b][t], (float*)m->Wf2, c->ff_hidden[b][t], D_MODEL, D_FF);
-            for (int d = 0; d < D_MODEL; d++)
-                c->res2[b][t][d] = c->res1[b][t][d] + c->ff_out[b][t][d];
+            linear_residual(c->res2[b][t], c->res1[b][t], (float*)m->Wf2, c->ff_hidden[b][t], D_MODEL, D_FF);
         }
 #endif
 
