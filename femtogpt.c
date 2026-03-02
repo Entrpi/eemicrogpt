@@ -1048,9 +1048,11 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 memset(dx, 0, sizeof(dx));
                 for (int v = 0; v < VOCAB; v++) {
                     if (dlogits[v] == 0.0f) continue;
-                    for (int d = 0; d < D_MODEL; d++) {
-                        g->Wlm[v][d] += dlogits[v] * c->res2[b][t][d];
-                        dx[d] += m->Wlm[v][d] * dlogits[v];
+                    float32x4_t dl_v = vdupq_n_f32(dlogits[v]);
+                    for (int d = 0; d < D_MODEL; d += 4) {
+                        float32x4_t r2 = vld1q_f32(&c->res2[b][t][d]);
+                        vst1q_f32(&g->Wlm[v][d], vfmaq_f32(vld1q_f32(&g->Wlm[v][d]), dl_v, r2));
+                        vst1q_f32(&dx[d], vfmaq_f32(vld1q_f32(&dx[d]), vld1q_f32(&m->Wlm[v][d]), dl_v));
                     }
                 }
 
@@ -1063,8 +1065,9 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 memset(dff_hidden, 0, sizeof(dff_hidden));
                 for (int d = 0; d < D_MODEL; d++) {
                     if (dx[d] == 0.0f) continue;
-                    for (int j = 0; j < D_FF; j++)
-                        dff_hidden[j] += m->Wf2[d][j] * dx[d];
+                    float32x4_t dx_d = vdupq_n_f32(dx[d]);
+                    for (int j = 0; j < D_FF; j += 4)
+                        vst1q_f32(&dff_hidden[j], vfmaq_f32(vld1q_f32(&dff_hidden[j]), dx_d, vld1q_f32(&m->Wf2[d][j])));
                 }
 
                 // ReLU backward
@@ -1076,20 +1079,27 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 memset(dnorm2, 0, sizeof(dnorm2));
                 for (int j = 0; j < D_FF; j++) {
                     if (dff_hidden[j] == 0.0f) continue;
-                    for (int d = 0; d < D_MODEL; d++)
-                        dnorm2[d] += m->Wf1[j][d] * dff_hidden[j];
+                    float32x4_t dh_j = vdupq_n_f32(dff_hidden[j]);
+                    for (int d = 0; d < D_MODEL; d += 4)
+                        vst1q_f32(&dnorm2[d], vfmaq_f32(vld1q_f32(&dnorm2[d]), dh_j, vld1q_f32(&m->Wf1[j][d])));
                 }
 
                 // Norm2 backward → update dx
                 {
                     float rms = c->norm2_rms[b][t];
                     float inv_rms = 1.0f / rms;
-                    float dot = 0.0f;
-                    for (int d = 0; d < D_MODEL; d++)
-                        dot += dnorm2[d] * c->res1[b][t][d];
-                    dot /= (rms * rms * D_MODEL);
-                    for (int d = 0; d < D_MODEL; d++)
-                        dx[d] += dnorm2[d] * inv_rms - c->res1[b][t][d] * dot;
+                    float32x4_t dot_v = vdupq_n_f32(0.0f);
+                    for (int d = 0; d < D_MODEL; d += 4)
+                        dot_v = vfmaq_f32(dot_v, vld1q_f32(&dnorm2[d]), vld1q_f32(&c->res1[b][t][d]));
+                    float dot = vaddvq_f32(dot_v) / (rms * rms * D_MODEL);
+                    float32x4_t inv_rms_v = vdupq_n_f32(inv_rms);
+                    float32x4_t dot_s = vdupq_n_f32(dot);
+                    for (int d = 0; d < D_MODEL; d += 4) {
+                        float32x4_t dn = vld1q_f32(&dnorm2[d]);
+                        float32x4_t r1 = vld1q_f32(&c->res1[b][t][d]);
+                        float32x4_t dxv = vld1q_f32(&dx[d]);
+                        vst1q_f32(&dx[d], vfmsq_f32(vfmaq_f32(dxv, dn, inv_rms_v), r1, dot_s));
+                    }
                 }
 
                 // --- O projection backward: Wo^T ---
@@ -1097,8 +1107,9 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 memset(dattn_out, 0, sizeof(dattn_out));
                 for (int d = 0; d < D_MODEL; d++) {
                     if (dx[d] == 0.0f) continue;
-                    for (int i = 0; i < D_MODEL; i++)
-                        dattn_out[i] += m->Wo[d][i] * dx[d];
+                    float32x4_t dx_d = vdupq_n_f32(dx[d]);
+                    for (int i = 0; i < D_MODEL; i += 4)
+                        vst1q_f32(&dattn_out[i], vfmaq_f32(vld1q_f32(&dattn_out[i]), dx_d, vld1q_f32(&m->Wo[d][i])));
                 }
 
                 // --- Attention backward ---
@@ -1187,22 +1198,25 @@ static void backward(Model *m, Cache *c, Grads *g) {
 
                 // Wo weight grads (using dx which = do_proj)
                 for (int d = 0; d < D_MODEL; d++) {
-                    for (int i = 0; i < D_MODEL; i++)
-                        g->Wo[d][i] += dx[d] * c->attn_out[b][t][i];
+                    float32x4_t dx_d = vdupq_n_f32(dx[d]);
+                    for (int i = 0; i < D_MODEL; i += 4)
+                        vst1q_f32(&g->Wo[d][i], vfmaq_f32(vld1q_f32(&g->Wo[d][i]), dx_d, vld1q_f32(&c->attn_out[b][t][i])));
                 }
 
                 // Wf2 weight grads (using dff_out = dx before FFN backward)
                 for (int d = 0; d < D_MODEL; d++) {
                     if (dff_out[d] == 0.0f) continue;
-                    for (int j = 0; j < D_FF; j++)
-                        g->Wf2[d][j] += dff_out[d] * c->ff_hidden[b][t][j];
+                    float32x4_t dfo_d = vdupq_n_f32(dff_out[d]);
+                    for (int j = 0; j < D_FF; j += 4)
+                        vst1q_f32(&g->Wf2[d][j], vfmaq_f32(vld1q_f32(&g->Wf2[d][j]), dfo_d, vld1q_f32(&c->ff_hidden[b][t][j])));
                 }
 
                 // Wf1 weight grads
                 for (int j = 0; j < D_FF; j++) {
                     if (dff_hidden[j] == 0.0f) continue;
-                    for (int d = 0; d < D_MODEL; d++)
-                        g->Wf1[j][d] += dff_hidden[j] * c->norm2[b][t][d];
+                    float32x4_t dh_j = vdupq_n_f32(dff_hidden[j]);
+                    for (int d = 0; d < D_MODEL; d += 4)
+                        vst1q_f32(&g->Wf1[j][d], vfmaq_f32(vld1q_f32(&g->Wf1[j][d]), dh_j, vld1q_f32(&c->norm2[b][t][d])));
                 }
 
                 // Clear dQ/dK/dV for next batch item
@@ -1215,35 +1229,46 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 {
                     float rms = c->norm1_rms[b][t];
                     float inv_rms = 1.0f / rms;
-                    float dot = 0.0f;
-                    for (int d = 0; d < D_MODEL; d++)
-                        dot += dnorm1[d] * c->emb[b][t][d];
-                    dot /= (rms * rms * D_MODEL);
-                    for (int d = 0; d < D_MODEL; d++)
-                        demb[d] = dnorm1[d] * inv_rms - c->emb[b][t][d] * dot;
+                    float32x4_t dot_v = vdupq_n_f32(0.0f);
+                    for (int d = 0; d < D_MODEL; d += 4)
+                        dot_v = vfmaq_f32(dot_v, vld1q_f32(&dnorm1[d]), vld1q_f32(&c->emb[b][t][d]));
+                    float dot = vaddvq_f32(dot_v) / (rms * rms * D_MODEL);
+                    float32x4_t inv_rms_v = vdupq_n_f32(inv_rms);
+                    float32x4_t dot_s = vdupq_n_f32(dot);
+                    for (int d = 0; d < D_MODEL; d += 4) {
+                        float32x4_t dn = vld1q_f32(&dnorm1[d]);
+                        float32x4_t e = vld1q_f32(&c->emb[b][t][d]);
+                        vst1q_f32(&demb[d], vfmsq_f32(vmulq_f32(dn, inv_rms_v), e, dot_s));
+                    }
                 }
 
                 // Residual connection
-                for (int d = 0; d < D_MODEL; d++)
-                    demb[d] += dx[d];
+                for (int d = 0; d < D_MODEL; d += 4)
+                    vst1q_f32(&demb[d], vaddq_f32(vld1q_f32(&demb[d]), vld1q_f32(&dx[d])));
 
                 // Emb RMS norm backward
                 float dtmp[D_MODEL];
                 {
                     float rms = c->emb_rms[b][t];
                     float inv_rms = 1.0f / rms;
-                    float dot = 0.0f;
-                    for (int d = 0; d < D_MODEL; d++)
-                        dot += demb[d] * c->raw_emb[b][t][d];
-                    dot /= (rms * rms * D_MODEL);
-                    for (int d = 0; d < D_MODEL; d++)
-                        dtmp[d] = demb[d] * inv_rms - c->raw_emb[b][t][d] * dot;
+                    float32x4_t dot_v = vdupq_n_f32(0.0f);
+                    for (int d = 0; d < D_MODEL; d += 4)
+                        dot_v = vfmaq_f32(dot_v, vld1q_f32(&demb[d]), vld1q_f32(&c->raw_emb[b][t][d]));
+                    float dot = vaddvq_f32(dot_v) / (rms * rms * D_MODEL);
+                    float32x4_t inv_rms_v = vdupq_n_f32(inv_rms);
+                    float32x4_t dot_s = vdupq_n_f32(dot);
+                    for (int d = 0; d < D_MODEL; d += 4) {
+                        float32x4_t de = vld1q_f32(&demb[d]);
+                        float32x4_t re = vld1q_f32(&c->raw_emb[b][t][d]);
+                        vst1q_f32(&dtmp[d], vfmsq_f32(vmulq_f32(de, inv_rms_v), re, dot_s));
+                    }
                 }
 
                 int tok = c->tokens[b][t];
-                for (int d = 0; d < D_MODEL; d++) {
-                    g->tok_emb[tok][d] += dtmp[d];
-                    g->pos_emb[t][d] += dtmp[d];
+                for (int d = 0; d < D_MODEL; d += 4) {
+                    float32x4_t dt = vld1q_f32(&dtmp[d]);
+                    vst1q_f32(&g->tok_emb[tok][d], vaddq_f32(vld1q_f32(&g->tok_emb[tok][d]), dt));
+                    vst1q_f32(&g->pos_emb[t][d], vaddq_f32(vld1q_f32(&g->pos_emb[t][d]), dt));
                 }
             }
         }
