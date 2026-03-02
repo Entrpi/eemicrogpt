@@ -1,9 +1,10 @@
 #!/bin/bash
 set -e
 
-SRC=~/femtogpt.c
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC="$DIR/eemicrogpt.c"
 BIN=/tmp/fgpt_sweep
-CSV=~/sweep_results.csv
+CSV="$DIR/sweep_results.csv"
 
 echo "sweep,value,backend,params,final_loss,us_per_step,fwd_us,bwd_us,total_ms" > "$CSV"
 
@@ -37,10 +38,11 @@ run() {
     done
 }
 
-# D_MODEL sweep (others at defaults)
-for dm in 16 32 64 128; do
+# D_MODEL sweep
+for dm in 16 32 64; do
     run "d_model" "$dm" "-DD_MODEL=$dm"
 done
+run "d_model" "128" "-DD_MODEL=128 -DN_HEADS=8"
 
 printf '%s\n' "$(printf '-%.0s' {1..82})"
 

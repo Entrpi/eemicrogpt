@@ -57,18 +57,18 @@ All benchmarks on Apple M5, single P-core. Python reference is microgpt.py (auto
 
 ### bpc@1s: best quality within ~1 second of training (batch=16)
 
-| d_model | backend | us/step | steps/s | loss | vs Python |
-|---------|---------|---------|---------|------|-----------|
-| 16 | scalar | 56.7 | 16,500/s | 2.0872 | **864x** |
-| 32 | scalar | 182 | 5,100/s | **2.0782** | **1040x** |
-| 64 | scalar | 874 | 1,050/s | 2.1363 | 816x |
-| 64 | SME2 | 633 | 1,500/s | 2.1221 | **1127x** |
-| 128 | scalar | 4,640 | 205/s | 2.2718 | 618x |
-| 128 | SME2 | 2,070 | 460/s | 2.1669 | **1385x** |
+| d_model | backend | us/step | steps/1s | loss | vs Python |
+|---------|---------|---------|----------|------|-----------|
+| 16 | scalar | 57.1 | 16,700 | 2.0869 | **858x** |
+| 32 | scalar | 181 | 5,150 | **2.0747** | **1045x** |
+| 64 | scalar | 832 | 1,100 | 2.1384 | 858x |
+| 64 | SME2 | 589 | 1,700 | 2.0974 | **1211x** |
+| 128 | scalar | 4,779 | 220 | 2.2633 | 600x |
+| 128 | SME2 | 1,904 | 545 | 2.1645 | **1506x** |
 
-**Winner: d32 scalar at LR=0.007 → loss 2.0782**
+**Winner: d32 scalar at LR=0.007 → loss 2.0747**
 
-d32 hits the sweet spot: enough capacity to learn well, small enough to run thousands of steps per second. At d16 the model is capacity-limited; at d64+ the per-step cost eats into the time budget.
+d32 hits the sweet spot: enough capacity to learn well, small enough to run thousands of steps per second. At d16 the model is capacity-limited; at d64+ the per-step cost eats into the time budget. The fused streaming-mode backward (optimization #10) gives the d64 SME2 path 200 extra steps, closing the gap with d32.
 
 ### Convergence reference (long runs, tuned LR)
 
@@ -76,7 +76,7 @@ d32 hits the sweet spot: enough capacity to learn well, small enough to run thou
 |---------|-------|-----|------|
 | 16 | 100k | 0.006 | ~2.06 (capacity floor) |
 | 32 | 500k | 0.002 | 1.92 |
-| 64 (SME2) | 1M | 0.0007 | 1.74 |
+| 64 (SME2) | 1M | 0.0007 | 1.74 (~10 min wall time) |
 
 ### Python baseline reference
 
@@ -84,10 +84,10 @@ d32 hits the sweet spot: enough capacity to learn well, small enough to run thou
 |---------|---------------|-------------------|---------|
 | 16 | 49.0 | 0.0567 | 864x |
 | 32 | 189.3 | 0.182 | 1040x |
-| 64 | 713.2 | 0.633 (SME2) | 1127x |
-| 128 | 2867.1 | 2.07 (SME2) | 1385x |
+| 64 | 713.2 | 0.582 (SME2) | **1225x** |
+| 128 | 2867.1 | 1.855 (SME2) | **1546x** |
 
-The speedup grows with model size because Python's per-operation overhead is constant while C's batched GEMM scales efficiently.
+The speedup grows with model size because Python's per-operation overhead is constant while C's batched GEMM scales efficiently. The SME2 path benefits from fused streaming-mode backward (see optimization #10), which reduced d64 by 19% and d128 by 29%.
 
 ## Why this likely beats a $40K GPU
 
@@ -110,8 +110,8 @@ The B200 delivers [90 TFLOPS FP32](https://www.rightnowai.co/guides/gpu-comparis
 |---------|-------------|-----------|-----------------|
 | 16 | 0.026 us | 0.5 us | **47 us** |
 | 32 | 0.094 us | 1.9 us | **182 us** |
-| 64 | 0.36 us | 7.2 us | **633 us** |
-| 128 | 1.4 us | 28 us | **2,070 us** |
+| 64 | 0.36 us | 7.2 us | **589 us** |
+| 128 | 1.4 us | 28 us | **1,904 us** |
 
 If the B200 could sustain even 5% utilization, it would crush us. It can't. The problem isn't compute — it's everything around the compute.
 
@@ -159,10 +159,10 @@ The B200 draws [1000W TDP](https://www.rightnowai.co/guides/gpu-comparison/b200)
 | d_model | M5 time | M5 energy | B200 time (best) | B200 energy | M5 efficiency |
 |---------|---------|-----------|-------------------|-------------|---------------|
 | 32 | 182 us | 2.7 mJ | ~130 us | 130 mJ | **48x** |
-| 64 | 633 us | 9.5 mJ | ~140 us | 140 mJ | **15x** |
-| 128 | 2,070 us | 31 mJ | ~170 us | 170 mJ | **5.5x** |
+| 64 | 589 us | 8.8 mJ | ~140 us | 140 mJ | **16x** |
+| 128 | 1,904 us | 29 mJ | ~170 us | 170 mJ | **5.9x** |
 
-Even at d128 where the B200 wins on wall time, the M5 uses 5.5x less energy per training step. The GPU pays 1000W whether its 148 SMs are busy or idle.
+Even at d128 where the B200 wins on wall time, the M5 uses 6x less energy per training step. The GPU pays 1000W whether its 148 SMs are busy or idle.
 
 ### Where GPU wins
 
@@ -377,6 +377,48 @@ Loop 7: LM head for all 16 batch items            (Wlm stays in L1)
 
 Each operation's weights are loaded into L1 once and reused across all 16 batch items before moving to the next operation. This reduced d64 SME2 forward+backward from 670 to 603 us/step (10%).
 
+### 10. Fused streaming-mode backward (d64: 717 → 582 us, 19%)
+
+SME2 functions tagged `__arm_locally_streaming` force the CPU into streaming mode (SMSTART) on entry and back out (SMSTOP) on exit. The backward pass called `sme2_outer_sum` six times back-to-back for weight gradients (dWq, dWk, dWv, dWo, dWf2, dWf1), plus `sme2_qkv_input_grad` — that's 7 streaming mode transitions per batch item, 112 per step.
+
+Each transition has direct costs (SMSTART/SMSTOP ~20-40 cycles each, ZA zeroing, register save/restore) but also indirect costs: the old code wrote each outer-product result to a temporary `dW_tmp` array, then ran a scalar loop to accumulate it into the gradient array. That's 6 extra load-accumulate-store passes over D_MODEL×D_MODEL floats.
+
+The fix: one function that enters streaming mode once, computes all 6 outer-product sums with inline SVE accumulation directly into the gradient arrays, transposes dQ/dK/dV, and computes the QKV input gradients — all before exiting streaming mode:
+
+```c
+__arm_locally_streaming __arm_new("za")
+static void sme2_backward_wgrads_and_input_grads(Grads *g, float *dnorm1_out, ...) {
+    // For each weight matrix: FMOPA tiles → SVE-add directly into g->Wq etc.
+    #define OUTER_SUM_ACCUM(dW, left, right, M, N) \
+        for (int bi = 0; bi < (M); bi += 16) { \
+            for (int bj = 0; bj < (N); bj += 16) { \
+                svzero_za(); \
+                for (int t = 0; t < MAX_SEQ; t++) { \
+                    svmopa_za32_f32_m(0, pred, pred, \
+                        svld1_f32(pred, (left) + t*(M) + bi), \
+                        svld1_f32(pred, (right) + t*(N) + bj)); \
+                } \
+                for (int i = 0; i < 16; i++) { \
+                    svfloat32_t row = svread_hor_za32_f32_m(svdup_f32(0), pred, 0, i); \
+                    svfloat32_t cur = svld1_f32(pred, (dW) + (bi+i)*(N) + bj); \
+                    svst1_f32(pred, (dW) + (bi+i)*(N) + bj, svadd_f32_x(pred, cur, row)); \
+                } \
+            } \
+        }
+    OUTER_SUM_ACCUM(g->Wq, dQ, norm1, D_MODEL, D_MODEL)  // ... ×6 weight matrices
+    // Then: transpose dQ/dK/dV and compute QKV input grads via FMOPA
+}
+```
+
+Results:
+
+| Config | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| d64 SME2 | 717 us | 582 us | **19%** |
+| d128 SME2 | 2625 us | 1855 us | **29%** |
+
+The d128 win is larger because it has more FMOPA tiles (8×8 vs 4×4 at d64) so the eliminated intermediate memory traffic is proportionally bigger.
+
 ## Optimization progression (d_model=16)
 
 | Step | Change | us/step | Improvement |
@@ -408,10 +450,11 @@ Not every idea was a win:
 - **Removing zero-checks in LM head backward**: Regression. The dlogits vector is 96% zeros (26/27 entries), so the zero-skip branch saves ~96% of the inner loop work. Similar story for ReLU-masked FFN hidden gradients (~50% zero).
 - **Splitting fused QKV weight+input grad loop**: Regression from cache pressure. The fused loop keeps dQ/dK/dV/norm1 hot in L1; splitting forces re-reads.
 - **Reducing Cache struct size**: No effect. The per-batch working set (~29 KB) already fits L1 (128 KB).
+- **Fusing FFN expand + ReLU + contract in streaming mode**: Regression. The ReLU + cache save between expand and contract involves a transposing scatter (`[D_FF][MAX_SEQ]` → `[MAX_SEQ][D_FF]`). Inside streaming mode, this runs as SSVE scalar code at ~3.6x the cost of Neon, outweighing the saved SMSTART/SMSTOP transition.
 
 ## File structure
 
-It's one file. 1742 lines. That's the point.
+It's one file. 1791 lines. That's the point.
 
 ```
 eemicrogpt.c    — everything

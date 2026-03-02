@@ -635,6 +635,90 @@ static void sme2_qkv_input_grad(
     }
 }
 
+// Fused backward: all 6 weight grad outer-product sums + QKV input grads
+// in a single streaming session (eliminates 7 SMSTART/SMSTOP transitions per batch item).
+// Accumulates directly into Grads using SVE loads/adds/stores.
+__arm_locally_streaming __arm_new("za")
+static void sme2_backward_wgrads_and_input_grads(
+    Grads *g, float *dnorm1_out,                               // [D_MODEL][MAX_SEQ]
+    const float *dQ, const float *dK, const float *dV,         // [MAX_SEQ][D_MODEL]
+    const float *norm1_b,                                       // [MAX_SEQ][D_MODEL]
+    const float *do_proj_all, const float *attn_out_b,          // [MAX_SEQ][D_MODEL]
+    const float *dff_out_all, const float *ff_hidden_b,         // [MAX_SEQ][D_MODEL], [MAX_SEQ][D_FF]
+    const float *dff_hidden_all, const float *norm2_b           // [MAX_SEQ][D_FF], [MAX_SEQ][D_MODEL]
+) {
+    svbool_t pred = svptrue_b32();
+
+    // --- Helper macro: outer-product sum with accumulation into grad array ---
+    // dW[M][N] += sum_t left[t][:M] outer right[t][:N]
+    #define OUTER_SUM_ACCUM(dW, left, right, M, N) \
+        for (int bi = 0; bi < (M); bi += 16) { \
+            for (int bj = 0; bj < (N); bj += 16) { \
+                svzero_za(); \
+                for (int t = 0; t < MAX_SEQ; t++) { \
+                    svfloat32_t l = svld1_f32(pred, (left) + t * (M) + bi); \
+                    svfloat32_t r = svld1_f32(pred, (right) + t * (N) + bj); \
+                    svmopa_za32_f32_m(0, pred, pred, l, r); \
+                } \
+                for (int i = 0; i < 16; i++) { \
+                    svfloat32_t row = svread_hor_za32_f32_m(svdup_f32(0), pred, 0, i); \
+                    svfloat32_t cur = svld1_f32(pred, (dW) + (bi + i) * (N) + bj); \
+                    svst1_f32(pred, (dW) + (bi + i) * (N) + bj, svadd_f32_x(pred, cur, row)); \
+                } \
+            } \
+        }
+
+    // 1. dWq += sum_t outer(dQ[t], norm1[t])
+    OUTER_SUM_ACCUM((float*)g->Wq, dQ, norm1_b, D_MODEL, D_MODEL)
+    // 2. dWk += sum_t outer(dK[t], norm1[t])
+    OUTER_SUM_ACCUM((float*)g->Wk, dK, norm1_b, D_MODEL, D_MODEL)
+    // 3. dWv += sum_t outer(dV[t], norm1[t])
+    OUTER_SUM_ACCUM((float*)g->Wv, dV, norm1_b, D_MODEL, D_MODEL)
+    // 4. dWo += sum_t outer(do_proj[t], attn_out[t])
+    OUTER_SUM_ACCUM((float*)g->Wo, do_proj_all, attn_out_b, D_MODEL, D_MODEL)
+    // 5. dWf2 += sum_t outer(dff_out[t], ff_hidden[t])
+    OUTER_SUM_ACCUM((float*)g->Wf2, dff_out_all, ff_hidden_b, D_MODEL, D_FF)
+    // 6. dWf1 += sum_t outer(dff_hidden[t], norm2[t])
+    OUTER_SUM_ACCUM((float*)g->Wf1, dff_hidden_all, norm2_b, D_FF, D_MODEL)
+
+    #undef OUTER_SUM_ACCUM
+
+    // --- QKV input grads: transpose dQ/dK/dV then compute dnorm1 ---
+    // Transpose [MAX_SEQ][D_MODEL] → [D_MODEL][MAX_SEQ] using SVE
+    float dQ_T[D_MODEL][MAX_SEQ], dK_T[D_MODEL][MAX_SEQ], dV_T[D_MODEL][MAX_SEQ];
+    // Scalar transpose (valid in streaming mode — avoids SMSTOP/SMSTART)
+    for (int t = 0; t < MAX_SEQ; t++)
+        for (int d = 0; d < D_MODEL; d++) {
+            dQ_T[d][t] = dQ[t * D_MODEL + d];
+            dK_T[d][t] = dK[t * D_MODEL + d];
+            dV_T[d][t] = dV[t * D_MODEL + d];
+        }
+
+    // dnorm1[D_MODEL][MAX_SEQ] = Wq_T @ dQ_T + Wk_T @ dK_T + Wv_T @ dV_T
+    for (int bi = 0; bi < D_MODEL; bi += 16) {
+        svzero_za();
+        for (int k = 0; k < D_MODEL; k++) {
+            svfloat32_t wq = svld1_f32(pred, (float*)Wq_T + k * D_MODEL + bi);
+            svfloat32_t dq = svld1_f32(pred, (float*)dQ_T + k * MAX_SEQ);
+            svmopa_za32_f32_m(0, pred, pred, wq, dq);
+        }
+        for (int k = 0; k < D_MODEL; k++) {
+            svfloat32_t wk = svld1_f32(pred, (float*)Wk_T + k * D_MODEL + bi);
+            svfloat32_t dk = svld1_f32(pred, (float*)dK_T + k * MAX_SEQ);
+            svmopa_za32_f32_m(0, pred, pred, wk, dk);
+        }
+        for (int k = 0; k < D_MODEL; k++) {
+            svfloat32_t wv = svld1_f32(pred, (float*)Wv_T + k * D_MODEL + bi);
+            svfloat32_t dv = svld1_f32(pred, (float*)dV_T + k * MAX_SEQ);
+            svmopa_za32_f32_m(0, pred, pred, wv, dv);
+        }
+        for (int i = 0; i < 16; i++) {
+            svfloat32_t row = svread_hor_za32_f32_m(svdup_f32(0), pred, 0, i);
+            svst1_f32(pred, dnorm1_out + (bi + i) * MAX_SEQ, row);
+        }
+    }
+}
+
 #endif // USE_SME2
 
 #if !USE_SME2
@@ -1101,51 +1185,16 @@ static void backward(Model *m, Cache *c, Grads *g) {
                 }
             }
 
-            // ---- Batched weight gradients (FMOPA outer products) ----
-            float dW_tmp[D_MODEL][D_MODEL];
-            sme2_outer_sum((float*)dW_tmp, (float*)dQ, (float*)(c->norm1[b]), D_MODEL, D_MODEL);
-            for (int d = 0; d < D_MODEL; d++)
-                for (int i = 0; i < D_MODEL; i++)
-                    g->Wq[d][i] += dW_tmp[d][i];
-
-            sme2_outer_sum((float*)dW_tmp, (float*)dK, (float*)(c->norm1[b]), D_MODEL, D_MODEL);
-            for (int d = 0; d < D_MODEL; d++)
-                for (int i = 0; i < D_MODEL; i++)
-                    g->Wk[d][i] += dW_tmp[d][i];
-
-            sme2_outer_sum((float*)dW_tmp, (float*)dV, (float*)(c->norm1[b]), D_MODEL, D_MODEL);
-            for (int d = 0; d < D_MODEL; d++)
-                for (int i = 0; i < D_MODEL; i++)
-                    g->Wv[d][i] += dW_tmp[d][i];
-
-            sme2_outer_sum((float*)dW_tmp, (float*)do_proj_all, (float*)(c->attn_out[b]), D_MODEL, D_MODEL);
-            for (int d = 0; d < D_MODEL; d++)
-                for (int i = 0; i < D_MODEL; i++)
-                    g->Wo[d][i] += dW_tmp[d][i];
-
-            float dWf2_tmp[D_MODEL][D_FF];
-            sme2_outer_sum((float*)dWf2_tmp, (float*)dff_out_all, (float*)(c->ff_hidden[b]), D_MODEL, D_FF);
-            for (int d = 0; d < D_MODEL; d++)
-                for (int j = 0; j < D_FF; j++)
-                    g->Wf2[d][j] += dWf2_tmp[d][j];
-
-            float dWf1_tmp[D_FF][D_MODEL];
-            sme2_outer_sum((float*)dWf1_tmp, (float*)dff_hidden_all, (float*)(c->norm2[b]), D_FF, D_MODEL);
-            for (int j = 0; j < D_FF; j++)
-                for (int d = 0; d < D_MODEL; d++)
-                    g->Wf1[j][d] += dWf1_tmp[j][d];
-
-            // QKV input grads (batched matmul)
-            float dQ_T[D_MODEL][MAX_SEQ], dK_T[D_MODEL][MAX_SEQ], dV_T[D_MODEL][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
-                for (int d = 0; d < D_MODEL; d++) {
-                    dQ_T[d][t] = dQ[t][d];
-                    dK_T[d][t] = dK[t][d];
-                    dV_T[d][t] = dV[t][d];
-                }
-
+            // ---- Fused weight grads + QKV input grads (single streaming session) ----
             float dnorm1_T[D_MODEL][MAX_SEQ];
-            sme2_qkv_input_grad((float*)dnorm1_T, (float*)dQ_T, (float*)dK_T, (float*)dV_T);
+            sme2_backward_wgrads_and_input_grads(
+                g, (float*)dnorm1_T,
+                (float*)dQ, (float*)dK, (float*)dV,
+                (float*)(c->norm1[b]),
+                (float*)do_proj_all, (float*)(c->attn_out[b]),
+                (float*)dff_out_all, (float*)(c->ff_hidden[b]),
+                (float*)dff_hidden_all, (float*)(c->norm2[b])
+            );
 
             // RMS norm backward + embedding backward
             for (int t = 0; t < slen; t++) {
