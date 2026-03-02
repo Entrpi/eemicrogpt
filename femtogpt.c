@@ -1053,15 +1053,15 @@ static void backward(Model *m, Cache *c, Grads *g) {
         // intermediate arrays and improving cache locality.
         {
             for (int t = MAX_SEQ - 1; t >= 0; t--) {
+                // Skip padding positions - all gradients are zero
+                if (t >= slen - 1) continue;
+
                 // --- LM head backward ---
                 float dlogits[VOCAB];
-                memset(dlogits, 0, sizeof(dlogits));
-                if (t < slen - 1) {
-                    int target = c->tokens[b][t + 1];
-                    for (int v = 0; v < VOCAB; v++)
-                        dlogits[v] = c->probs[b][t][v] * inv_count;
-                    dlogits[target] -= inv_count;
-                }
+                int target = c->tokens[b][t + 1];
+                for (int v = 0; v < VOCAB; v++)
+                    dlogits[v] = c->probs[b][t][v] * inv_count;
+                dlogits[target] -= inv_count;
 
                 float dx[D_MODEL];
                 memset(dx, 0, sizeof(dx));
