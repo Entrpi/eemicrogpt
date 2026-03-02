@@ -597,8 +597,10 @@ static inline __attribute__((always_inline)) void neon_matmul_t_acc(
 // ============================================================
 static float forward(Model *m, Cache *c) {
     for (int b = 0; b < BATCH; b++) {
+        int slen = c->seq_lens[b];
+
         // 1-3. Embeddings + RMS norms (element-wise, not matmuls)
-        for (int t = 0; t < MAX_SEQ; t++) {
+        for (int t = 0; t < slen; t++) {
             int tok = c->tokens[b][t];
             for (int d = 0; d < D_MODEL; d++)
                 c->raw_emb[b][t][d] = m->tok_emb[tok][d] + m->pos_emb[t][d];
@@ -643,7 +645,7 @@ static float forward(Model *m, Cache *c) {
         // 5. Multi-head causal attention
         for (int h = 0; h < N_HEADS; h++) {
             int hoff = h * HEAD_DIM;
-            for (int t = 0; t < MAX_SEQ; t++) {
+            for (int t = 0; t < slen; t++) {
 #if HEAD_DIM == 4
                 float32x4_t qt = vld1q_f32(&c->Q[b][t][hoff]);
                 for (int s = 0; s <= t; s++) {
@@ -685,7 +687,7 @@ static float forward(Model *m, Cache *c) {
                 for (int d = 0; d < D_MODEL; d++)
                     A_T[d][t] = c->attn_out[b][t][d];
             sme2_o_project((float*)O_T, (float*)A_T);
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++) {
                     c->o_proj[b][t][d] = O_T[d][t];
                     c->res1[b][t][d] = c->emb[b][t][d] + O_T[d][t];
@@ -698,7 +700,7 @@ static float forward(Model *m, Cache *c) {
                 for (int d = 0; d < D_MODEL; d++)
                     A_T[d][t] = c->attn_out[b][t][d];
             neon_matmul((float*)O_T, (float*)m->Wo, (float*)A_T, D_MODEL, D_MODEL, MAX_SEQ);
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++) {
                     c->o_proj[b][t][d] = O_T[d][t];
                     c->res1[b][t][d] = c->emb[b][t][d] + O_T[d][t];
@@ -707,7 +709,7 @@ static float forward(Model *m, Cache *c) {
 #endif
 
         // 7. RMS norm (pre-FFN)
-        for (int t = 0; t < MAX_SEQ; t++)
+        for (int t = 0; t < slen; t++)
             rms_norm(c->norm2[b][t], c->res1[b][t], D_MODEL, &c->norm2_rms[b][t]);
 
         // 8. FFN: expand + ReLU + contract + residual
@@ -721,7 +723,7 @@ static float forward(Model *m, Cache *c) {
             float H[D_FF][MAX_SEQ];
             sme2_ffn_expand((float*)H, (float*)N2_T);
 
-            for (int t = 0; t < MAX_SEQ; t++) {
+            for (int t = 0; t < slen; t++) {
                 for (int j = 0; j < D_FF; j++) {
                     c->ff_pre_relu[b][t][j] = H[j][t];
                     float v = H[j][t] > 0.0f ? H[j][t] : 0.0f;
@@ -733,7 +735,7 @@ static float forward(Model *m, Cache *c) {
             float Y[D_MODEL][MAX_SEQ];
             sme2_ffn_contract((float*)Y, (float*)H);
 
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++) {
                     c->ff_out[b][t][d] = Y[d][t];
                     c->res2[b][t][d] = c->res1[b][t][d] + Y[d][t];
@@ -749,7 +751,7 @@ static float forward(Model *m, Cache *c) {
             float H[D_FF][MAX_SEQ];
             neon_matmul((float*)H, (float*)m->Wf1, (float*)N2_T, D_FF, D_MODEL, MAX_SEQ);
 
-            for (int t = 0; t < MAX_SEQ; t++) {
+            for (int t = 0; t < slen; t++) {
                 for (int j = 0; j < D_FF; j++) {
                     c->ff_pre_relu[b][t][j] = H[j][t];
                     float v = H[j][t] > 0.0f ? H[j][t] : 0.0f;
@@ -761,7 +763,7 @@ static float forward(Model *m, Cache *c) {
             float Y[D_MODEL][MAX_SEQ];
             neon_matmul((float*)Y, (float*)m->Wf2, (float*)H, D_MODEL, D_FF, MAX_SEQ);
 
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++) {
                     c->ff_out[b][t][d] = Y[d][t];
                     c->res2[b][t][d] = c->res1[b][t][d] + Y[d][t];
@@ -777,14 +779,14 @@ static float forward(Model *m, Cache *c) {
                 for (int d = 0; d < D_MODEL; d++)
                     R_T[d][t] = c->res2[b][t][d];
             neon_matmul((float*)L_T, (float*)m->Wlm, (float*)R_T, VOCAB, D_MODEL, MAX_SEQ);
-            for (int t = 0; t < MAX_SEQ; t++) {
+            for (int t = 0; t < slen; t++) {
                 for (int v = 0; v < VOCAB; v++)
                     c->logits[b][t][v] = L_T[v][t];
                 softmax(c->probs[b][t], c->logits[b][t], VOCAB);
             }
         }
 #else
-        for (int t = 0; t < MAX_SEQ; t++) {
+        for (int t = 0; t < slen; t++) {
             linear(c->logits[b][t], (float*)m->Wlm, c->res2[b][t], VOCAB, D_MODEL);
             softmax(c->probs[b][t], c->logits[b][t], VOCAB);
         }
@@ -884,7 +886,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
             sme2_matmul((float*)dnorm2_T, (float*)m->Wf1, (float*)dff_hidden_T, D_MODEL, D_FF);
 
             // Stage E: RMS norm2 backward, update dx
-            for (int t = 0; t < MAX_SEQ; t++) {
+            for (int t = 0; t < slen; t++) {
                 float rms = c->norm2_rms[b][t];
                 float inv_rms = 1.0f / rms;
                 float dot = 0.0f;
@@ -907,7 +909,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
             sme2_matmul((float*)dattn_out_T, (float*)m->Wo, (float*)dx_T, D_MODEL, D_MODEL);
 
             // Stage G: Attention backward
-            for (int t = MAX_SEQ - 1; t >= 0; t--) {
+            for (int t = slen - 1; t >= 0; t--) {
                 for (int h = 0; h < N_HEADS; h++) {
                     int hoff = h * HEAD_DIM;
                     float dattn_scores_h[MAX_SEQ];
@@ -1007,7 +1009,7 @@ static void backward(Model *m, Cache *c, Grads *g) {
             sme2_qkv_input_grad((float*)dnorm1_T, (float*)dQ_T, (float*)dK_T, (float*)dV_T);
 
             // RMS norm backward + embedding backward
-            for (int t = 0; t < MAX_SEQ; t++) {
+            for (int t = 0; t < slen; t++) {
                 float dnorm1[D_MODEL];
                 for (int d = 0; d < D_MODEL; d++)
                     dnorm1[d] = dnorm1_T[d][t];
