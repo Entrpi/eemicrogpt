@@ -526,36 +526,62 @@ static void sme2_qkv_input_grad(
 // ============================================================
 #if !USE_SME2
 
-// C[M][N] = W[M][K] @ X[K][N]  (W in standard row-major)
-// When N=16, keeps accumulators in registers across K loop (eliminates C load/stores)
+// C[M][stride] = W[M][K] @ X[K][stride], processing only ncols columns
+// Uses register accumulators: 1-4 float32x4_t based on ncols (rounded up to multiple of 4)
+// stride = array row width (MAX_SEQ), ncols = actual columns to compute
 static inline __attribute__((always_inline)) void neon_matmul(
-    float *C, const float *W, const float *X, int M, int K, int N
+    float *C, const float *W, const float *X, int M, int K, int stride, int ncols
 ) {
-#if MAX_SEQ == 16
-    if (N == 16) {
+    int n4 = (ncols + 3) >> 2;
+    switch (n4) {
+    case 1:
+        for (int m = 0; m < M; m++) {
+            float32x4_t a0 = vdupq_n_f32(0);
+            for (int k = 0; k < K; k++)
+                a0 = vfmaq_f32(a0, vdupq_n_f32(W[m*K+k]), vld1q_f32(X + k*stride));
+            vst1q_f32(C + m*stride, a0);
+        }
+        break;
+    case 2:
+        for (int m = 0; m < M; m++) {
+            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+            for (int k = 0; k < K; k++) {
+                float32x4_t w = vdupq_n_f32(W[m*K+k]);
+                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*stride));
+                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*stride + 4));
+            }
+            vst1q_f32(C + m*stride, a0); vst1q_f32(C + m*stride + 4, a1);
+        }
+        break;
+    case 3:
+        for (int m = 0; m < M; m++) {
+            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0), a2 = vdupq_n_f32(0);
+            for (int k = 0; k < K; k++) {
+                float32x4_t w = vdupq_n_f32(W[m*K+k]);
+                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*stride));
+                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*stride + 4));
+                a2 = vfmaq_f32(a2, w, vld1q_f32(X + k*stride + 8));
+            }
+            vst1q_f32(C + m*stride, a0); vst1q_f32(C + m*stride + 4, a1);
+            vst1q_f32(C + m*stride + 8, a2);
+        }
+        break;
+    default: // 4 (N=13..16)
         for (int m = 0; m < M; m++) {
             float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
             float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
             for (int k = 0; k < K; k++) {
-                float32x4_t w = vdupq_n_f32(W[m * K + k]);
-                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*16));
-                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*16 + 4));
-                a2 = vfmaq_f32(a2, w, vld1q_f32(X + k*16 + 8));
-                a3 = vfmaq_f32(a3, w, vld1q_f32(X + k*16 + 12));
+                float32x4_t w = vdupq_n_f32(W[m*K+k]);
+                a0 = vfmaq_f32(a0, w, vld1q_f32(X + k*stride));
+                a1 = vfmaq_f32(a1, w, vld1q_f32(X + k*stride + 4));
+                a2 = vfmaq_f32(a2, w, vld1q_f32(X + k*stride + 8));
+                a3 = vfmaq_f32(a3, w, vld1q_f32(X + k*stride + 12));
             }
-            vst1q_f32(C + m*16,     a0); vst1q_f32(C + m*16 + 4,  a1);
-            vst1q_f32(C + m*16 + 8, a2); vst1q_f32(C + m*16 + 12, a3);
+            vst1q_f32(C + m*stride, a0); vst1q_f32(C + m*stride + 4, a1);
+            vst1q_f32(C + m*stride + 8, a2); vst1q_f32(C + m*stride + 12, a3);
         }
-        return;
+        break;
     }
-#endif
-    memset(C, 0, M * N * sizeof(float));
-    for (int m = 0; m < M; m++)
-        for (int k = 0; k < K; k++) {
-            float32x4_t w = vdupq_n_f32(W[m * K + k]);
-            for (int n = 0; n < N; n += 4)
-                vst1q_f32(C + m*N + n, vfmaq_f32(vld1q_f32(C + m*N + n), w, vld1q_f32(X + k*N + n)));
-        }
 }
 
 // C[M][N] = W_orig^T @ X  where W_orig is stored [K][M]
@@ -626,14 +652,14 @@ static float forward(Model *m, Cache *c) {
 #else
         {
             float X_T[D_MODEL][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++)
                     X_T[d][t] = c->norm1[b][t][d];
             float Q_T[D_MODEL][MAX_SEQ], K_T[D_MODEL][MAX_SEQ], V_T[D_MODEL][MAX_SEQ];
-            neon_matmul((float*)Q_T, (float*)m->Wq, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ);
-            neon_matmul((float*)K_T, (float*)m->Wk, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ);
-            neon_matmul((float*)V_T, (float*)m->Wv, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ);
-            for (int t = 0; t < MAX_SEQ; t++)
+            neon_matmul((float*)Q_T, (float*)m->Wq, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ, slen);
+            neon_matmul((float*)K_T, (float*)m->Wk, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ, slen);
+            neon_matmul((float*)V_T, (float*)m->Wv, (float*)X_T, D_MODEL, D_MODEL, MAX_SEQ, slen);
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++) {
                     c->Q[b][t][d] = Q_T[d][t];
                     c->K[b][t][d] = K_T[d][t];
@@ -696,10 +722,10 @@ static float forward(Model *m, Cache *c) {
 #else
         {
             float A_T[D_MODEL][MAX_SEQ], O_T[D_MODEL][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++)
                     A_T[d][t] = c->attn_out[b][t][d];
-            neon_matmul((float*)O_T, (float*)m->Wo, (float*)A_T, D_MODEL, D_MODEL, MAX_SEQ);
+            neon_matmul((float*)O_T, (float*)m->Wo, (float*)A_T, D_MODEL, D_MODEL, MAX_SEQ, slen);
             for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++) {
                     c->o_proj[b][t][d] = O_T[d][t];
@@ -744,12 +770,12 @@ static float forward(Model *m, Cache *c) {
 #else
         {
             float N2_T[D_MODEL][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++)
                     N2_T[d][t] = c->norm2[b][t][d];
 
             float H[D_FF][MAX_SEQ];
-            neon_matmul((float*)H, (float*)m->Wf1, (float*)N2_T, D_FF, D_MODEL, MAX_SEQ);
+            neon_matmul((float*)H, (float*)m->Wf1, (float*)N2_T, D_FF, D_MODEL, MAX_SEQ, slen);
 
             for (int t = 0; t < slen; t++) {
                 for (int j = 0; j < D_FF; j++) {
@@ -761,7 +787,7 @@ static float forward(Model *m, Cache *c) {
             }
 
             float Y[D_MODEL][MAX_SEQ];
-            neon_matmul((float*)Y, (float*)m->Wf2, (float*)H, D_MODEL, D_FF, MAX_SEQ);
+            neon_matmul((float*)Y, (float*)m->Wf2, (float*)H, D_MODEL, D_FF, MAX_SEQ, slen);
 
             for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++) {
@@ -775,10 +801,10 @@ static float forward(Model *m, Cache *c) {
 #if !USE_SME2
         {
             float R_T[D_MODEL][MAX_SEQ], L_T[VOCAB][MAX_SEQ];
-            for (int t = 0; t < MAX_SEQ; t++)
+            for (int t = 0; t < slen; t++)
                 for (int d = 0; d < D_MODEL; d++)
                     R_T[d][t] = c->res2[b][t][d];
-            neon_matmul((float*)L_T, (float*)m->Wlm, (float*)R_T, VOCAB, D_MODEL, MAX_SEQ);
+            neon_matmul((float*)L_T, (float*)m->Wlm, (float*)R_T, VOCAB, D_MODEL, MAX_SEQ, slen);
             for (int t = 0; t < slen; t++) {
                 for (int v = 0; v < VOCAB; v++)
                     c->logits[b][t][v] = L_T[v][t];
