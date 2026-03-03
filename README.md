@@ -1,11 +1,11 @@
 # EEmicroGPT
 
 > *"This file is the complete algorithm. Everything else is just efficiency."*
-> — Andrej Karpathy, [microgpt.py](https://github.com/karpathy/microgpt)
+> — Andrej Karpathy, [microgpt.py](https://karpathy.github.io/2026/02/12/microgpt/)
 
 **This file is the everything else.**
 
-EEmicroGPT is a single-file, dependency-free C implementation of GPT training — forward pass, backward pass, Adam optimizer, and autoregressive generation — optimized from the ground up for Apple Silicon. It trains a character-level name generator on the same architecture and dataset as Karpathy's microgpt.py, producing identical learning dynamics **up to 19,000x faster** per training sample.
+[EEmicroGPT](https://github.com/Entrpi/eemicrogpt/blob/master/eemicrogpt.c) is a single-file, dependency-free C implementation of GPT training — forward pass, backward pass, Adam optimizer, and autoregressive generation — optimized from the ground up for Apple Silicon. It trains a character-level name generator on the same architecture and dataset as Karpathy's microgpt.py, producing identical learning dynamics **up to 19,000x faster** per training sample.
 
 The name stands for "Everything Else" (or "Extreme Efficiency") — the half of the equation that microgpt.py intentionally leaves on the table.
 
@@ -182,13 +182,59 @@ Even at d128 where the B200 wins on wall time, the M5 uses 6x less energy per tr
 
 ### Where GPU wins
 
-The crossover is real — it just happens at larger scales than this model:
+The crossover is real — and lower than these theoretical estimates suggest. Our [measurements on the same M5](#measured-cpu-vs-gpu-on-m5) show the crossover at d256 with batch=16, and as low as d64 with batch=128. A B200 would crossover even earlier.
 
-- **d_model >= 512**: Matrices large enough to fill GPU SMs. cuBLAS hits >50% utilization. GEMM compute dominates launch overhead.
-- **Large batches (256+)**: More positions to process in parallel, justifying the GPU's thread count.
-- **Multi-layer models**: More sequential GEMMs amortize the overhead, and total compute grows faster than kernel count.
+Still, for a 1-layer character model with d_model <= 128 and batch=16, a single CPU core with L1-resident weights and zero-overhead dispatch is hard to beat at any price — especially a core with native matrix operations.
 
-For a 1-layer character model with d_model <= 128 and batch=16, a single CPU core with L1-resident weights and zero-overhead dispatch is hard to beat at any price — especially a core with native matrix operations.
+## Measured: CPU vs GPU on M5
+
+Theory is nice. Here are actual numbers: EEmicroGPT (1 CPU core, batch=16) vs [MLX](https://github.com/ml-explore/mlx) (Apple's ML framework on the M5's 10-core GPU), both on the same machine.
+
+### Per-sample time at equal batch size (batch=16)
+
+| d_model | EEmicroGPT | MLX GPU | Faster |
+|---------|-----------|---------|--------|
+| 16 | 3.0 us | 72 us | EE 24x |
+| 32 | 11.4 us | 72 us | EE 6.3x |
+| 64 | 36.8 us | 72 us | EE 2.0x |
+| 128 | 119 us | 197 us | EE 1.7x |
+| 256 | 443 us | 204 us | MLX 2.2x |
+| 512 | 2,335 us | 423 us | MLX 5.5x |
+| 1024 | 13,558 us | 1,482 us | MLX 9.2x |
+
+The GPU has a ~1 ms overhead floor per step regardless of model size (Metal command buffer submission). At batch=16 this amortizes to ~72 us/sample — a floor that EE beats up to d128.
+
+![CPU vs GPU crossover](docs/crossover.png)
+
+### Larger batches favor GPU
+
+This model trains well with large batches — loss improves monotonically up to batch=128 with no per-sample throughput penalty on GPU. Larger batches amortize GPU dispatch overhead, pushing the crossover down:
+
+| d_model | EE (batch=16) | MLX (batch=128) | Faster |
+|---------|--------------|-----------------|--------|
+| 16 | 3.0 us | 21 us | EE 7x |
+| 32 | 11.4 us | 23 us | EE 2x |
+| 64 | 36.8 us | 36 us | ~tied |
+| 128 | 119 us | 41 us | MLX 2.9x |
+
+At batch=128 the crossover drops to d64. At batch=256, it drops below d32.
+
+### Where EE matters: seconds-scale sweeps
+
+The GPU catches up and eventually wins — especially at larger batches and model sizes. But EE's advantage is in exactly the regime that matters most for this class of model: getting the best result you can in a few seconds.
+
+Sweeping across (d_model, batch_size, learning_rate) for fastest time to loss < 2.0:
+
+| Engine | Best config | Time to loss < 2.0 |
+|--------|------------|-------------------|
+| **EEmicroGPT** | d32, batch=64, lr=0.007 | **5.1s** |
+| MLX GPU | d64, batch=256, lr=0.007 | 7.2s |
+
+![Pareto frontier: loss vs wall time](docs/pareto_clean.png)
+
+EE dominates the 0–7 second regime. MLX pulls ahead after ~20 seconds, where larger models have time to converge.
+
+At EE's speed, a 100-configuration hyperparameter sweep finishes in under 10 minutes. That's the difference between an interactive experience — tweak, train, evaluate, repeat — and an overnight batch job. For small models where the goal is rapid exploration, a single CPU core with L1-resident weights is the faster path to a good model.
 
 ## How it works: optimization deep-dive
 
@@ -470,7 +516,7 @@ Not every idea was a win:
 
 ## File structure
 
-It's one file. 1791 lines. That's the point.
+It's [one file](https://github.com/Entrpi/eemicrogpt/blob/master/eemicrogpt.c) . 1791 lines. That's the point.
 
 ```
 eemicrogpt.c    — everything
